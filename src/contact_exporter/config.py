@@ -13,7 +13,7 @@ CALLBACK_PORT = 9876
 CALLBACK_URL = f"http://localhost:{CALLBACK_PORT}/callback"
 
 # Powerset API
-API_BASE_URL = os.environ.get("POWERSET_API_URL", "https://api.powerset.dev")
+API_BASE_URL = os.environ.get("POWERSET_API_URL", "https://search-api-7wk4uhe77q-uw.a.run.app")
 
 # Credentials storage (~/.powerset/credentials.json)
 CREDENTIALS_DIR = ".powerset"
