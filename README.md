@@ -22,51 +22,43 @@ Everything runs on your machine. The only data that leaves is what you explicitl
 - **Privacy-first auth** — Auth0 PKCE flow (no secrets stored, browser-based login)
 - **Zero-config permissions** — automatically opens System Settings when Full Disk Access or Contacts access is needed
 
-## Prerequisites
-
-- **macOS** (required — iMessage and Contacts.app are macOS-only)
-- **[Homebrew](https://brew.sh)** — package manager for macOS
-- **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** — **only** needed for WhatsApp extraction; iMessage works without it
-
-> ⚠️ **Docker must be installed manually** before running WhatsApp extraction.
-> Install it via `brew install --cask docker`, or download from [docker.com](https://www.docker.com/products/docker-desktop/).
-> After installing, open Docker Desktop from Applications at least once to complete setup.
-
 ## Installation
 
-### Download and run (recommended)
-
-Download the installer, inspect it, then run:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/powerset-co/contact-exporter/main/install.sh -o install.sh
-less install.sh   # review the script before running
-bash install.sh
-```
-
-Or as a one-liner (downloads to a temp file first — never pipes to shell):
+### One-liner (recommended)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/powerset-co/contact-exporter/main/install.sh -o /tmp/ce-install.sh && bash /tmp/ce-install.sh
 ```
 
-> **Why not `curl | bash`?** Piping directly to a shell is vulnerable to partial-download attacks — if the connection drops mid-transfer, your shell executes a truncated script. Downloading first ensures you run the complete, unmodified script over HTTPS.
+This downloads the installer to a temp file (never pipes directly to shell), then walks you through setup: Homebrew, Docker Desktop, and `contact-exporter` itself.
 
-### Homebrew
+> **Why not `curl | bash`?** Piping directly to a shell is vulnerable to partial-download attacks -- if the connection drops mid-transfer, your shell executes a truncated script. Downloading first ensures you run the complete, unmodified script over HTTPS.
+
+### Manual install
+
+If you prefer to do it yourself, here are the three steps:
+
+**1. Install Homebrew** (if you don't have it)
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+**2. Install Docker Desktop** (required for WhatsApp extraction)
+
+```bash
+brew install --cask docker
+```
+
+After installing, open Docker Desktop from Applications at least once to complete setup. If you only need iMessage extraction, you can skip this step.
+
+**3. Install contact-exporter**
 
 ```bash
 brew install powerset-co/powerset/contact-exporter
 ```
 
-### From source
-
-Requires Python 3.10+ and [imsg](https://github.com/steipete/imsg).
-
-```bash
-git clone https://github.com/powerset-co/contact-exporter.git
-cd contact-exporter
-pip install -e .
-```
+This installs Python, all dependencies, and the `contact-exporter` CLI into an isolated Homebrew environment. No need to manage Python versions or virtual environments yourself.
 
 ## Quick start
 
@@ -154,6 +146,8 @@ POWERSET_API_URL=http://localhost:8000 contact-exporter upload
 See [SECURITY.md](SECURITY.md) for the full threat model, security controls, and vulnerability reporting.
 
 ## Development
+
+Requires Python 3.10+ and [imsg](https://github.com/steipete/imsg).
 
 ```bash
 git clone https://github.com/powerset-co/contact-exporter.git
