@@ -1,12 +1,12 @@
 #!/bin/bash
-# Contact Exporter — installer
+# Contact Exporter -- installer
 #
-# SECURE USAGE (recommended — download, inspect, then run):
+# SECURE USAGE (recommended -- download, inspect, then run):
 #   curl -fsSL https://raw.githubusercontent.com/powerset-co/contact-exporter/main/install.sh -o install.sh
 #   less install.sh
 #   bash install.sh
 #
-# ONE-LINER (downloads to temp file first — never pipes directly to shell):
+# ONE-LINER (downloads to temp file first -- never pipes directly to shell):
 #   curl -fsSL https://raw.githubusercontent.com/powerset-co/contact-exporter/main/install.sh -o /tmp/ce-install.sh && bash /tmp/ce-install.sh
 #
 set -euo pipefail
@@ -23,7 +23,7 @@ NC='\033[0m'
 # ---------------------------------------------------------------------------
 
 # Detect if script is being piped directly to shell (curl | bash)
-# This is a security risk — the download could be truncated mid-stream,
+# This is a security risk -- the download could be truncated mid-stream,
 # causing partial script execution with unpredictable results.
 if [ ! -t 0 ] && [ -z "${CONTACT_EXPORTER_ALLOW_PIPE:-}" ]; then
     echo ""
@@ -47,7 +47,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 echo ""
-echo -e "${BOLD}📱 Contact Exporter Installer${NC}"
+echo -e "${BOLD}Contact Exporter Installer${NC}"
 echo -e "${DIM}Extract iMessage & WhatsApp contacts locally${NC}"
 echo ""
 
@@ -65,14 +65,14 @@ if ! command -v brew &>/dev/null; then
     echo "Then re-run this installer."
     exit 1
 else
-    echo -e "${GREEN}✓${NC} Homebrew"
+    echo -e "${GREEN}ok${NC} Homebrew"
 fi
 
 # 2. Check Docker (required for WhatsApp, manual install only)
 if command -v docker &>/dev/null; then
-    echo -e "${GREEN}✓${NC} Docker"
+    echo -e "${GREEN}ok${NC} Docker"
 else
-    echo -e "${YELLOW}⚠${NC} Docker not found (needed for WhatsApp extraction)"
+    echo -e "${YELLOW}!!${NC} Docker not found (needed for WhatsApp extraction)"
     echo -e "  ${DIM}Install manually: brew install --cask docker${NC}"
     echo -e "  ${DIM}iMessage extraction works without Docker${NC}"
 fi
@@ -85,10 +85,10 @@ echo ""
 echo -e "${DIM}Installing contact-exporter via Homebrew...${NC}"
 brew install powerset-co/powerset/contact-exporter
 
-echo -e "${GREEN}✓${NC} contact-exporter + imsg"
+echo -e "${GREEN}ok${NC} contact-exporter + imsg"
 
 echo ""
-echo -e "${GREEN}${BOLD}✅ Installed!${NC}"
+echo -e "${GREEN}${BOLD}Installed!${NC}"
 echo ""
 echo -e "  ${BOLD}contact-exporter login${NC}      Authenticate with Powerset"
 echo -e "  ${BOLD}contact-exporter imessage${NC}   Extract iMessage contacts"
