@@ -45,7 +45,7 @@ def upload_contacts(file_path: str = "contacts.csv") -> None:
                 "name": contact.name,
                 "source": contact.source,
                 "is_in_group_chats": contact.is_in_group_chats,
-                "message_count": contact.message_count,
+                "message_count": contact.message_count or 0,
                 "last_message": contact.last_message,
             })
 
