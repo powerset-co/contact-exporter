@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Credentials (never commit)
+credentials.json
+.powerset/
+
+# Extraction output
+contacts.csv
+contacts.jsonl
+
+# Claude Code
+.claude/
