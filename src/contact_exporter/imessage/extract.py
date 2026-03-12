@@ -62,8 +62,8 @@ def _normalize_phone(raw: str) -> str:
     return digits
 
 
-def _build_contact_name_lookup() -> dict[str, str]:
-    """Build phone -> name mapping from macOS Contacts.app via AppleScript."""
+def _query_contacts_app() -> dict[str, str]:
+    """Run the AppleScript query against Contacts.app and parse the results."""
     try:
         subprocess.run(
             ["osascript", "-e", 'tell application "Contacts" to launch'],
@@ -97,6 +97,43 @@ def _build_contact_name_lookup() -> dict[str, str]:
         # Also store full digits for international numbers
         if digits != normalized:
             lookup[digits] = name
+
+    return lookup
+
+
+def _restart_contacts_app():
+    """Quit and relaunch Contacts.app to clear stale state."""
+    console.print("[dim]Restarting Contacts.app...[/dim]")
+    subprocess.run(
+        ["osascript", "-e", 'tell application "Contacts" to quit'],
+        capture_output=True, text=True, timeout=10,
+    )
+    time.sleep(3)
+    subprocess.run(
+        ["osascript", "-e", 'tell application "Contacts" to launch'],
+        capture_output=True, text=True, timeout=10,
+    )
+    time.sleep(3)
+
+
+def _build_contact_name_lookup() -> dict[str, str]:
+    """Build phone -> name mapping from macOS Contacts.app via AppleScript.
+
+    If the first attempt returns 0 contacts (stale app state), automatically
+    restarts Contacts.app and retries once.
+    """
+    lookup = _query_contacts_app()
+    if lookup:
+        return lookup
+
+    console.print("[yellow]Warning: Contacts.app returned 0 contacts -- app may be in a bad state[/yellow]")
+    _restart_contacts_app()
+    console.print("[dim]Retrying contact lookup...[/dim]")
+    lookup = _query_contacts_app()
+
+    if not lookup:
+        console.print("[yellow]Still got 0 contacts after restart. Names will be missing from export.[/yellow]")
+        console.print("[dim]Try closing Contacts.app manually, reopening it, and running again.[/dim]")
 
     return lookup
 
