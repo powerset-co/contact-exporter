@@ -57,13 +57,19 @@ echo ""
 
 # 1. Check/install Homebrew
 if ! command -v brew &>/dev/null; then
-    echo -e "${YELLOW}Homebrew is required but not installed.${NC}"
-    echo ""
-    echo "Install it first:"
-    echo -e "  ${BOLD}/bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"${NC}"
-    echo ""
-    echo "Then re-run this installer."
-    exit 1
+    echo -e "${YELLOW}Homebrew not found. Installing...${NC}"
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    # Add brew to PATH for this session
+    if [[ -f /opt/homebrew/bin/brew ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [[ -f /usr/local/bin/brew ]]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+    fi
+    if ! command -v brew &>/dev/null; then
+        echo -e "${RED}Homebrew installation failed. Please install manually and re-run.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}ok${NC} Homebrew installed"
 else
     echo -e "${GREEN}ok${NC} Homebrew"
 fi
