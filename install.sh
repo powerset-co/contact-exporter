@@ -68,13 +68,24 @@ else
     echo -e "${GREEN}ok${NC} Homebrew"
 fi
 
-# 2. Check Docker (required for WhatsApp, manual install only)
+# 2. Check/install Docker (required for WhatsApp)
 if command -v docker &>/dev/null; then
     echo -e "${GREEN}ok${NC} Docker"
 else
-    echo -e "${YELLOW}!!${NC} Docker not found (needed for WhatsApp extraction)"
-    echo -e "  ${DIM}Install manually: brew install --cask docker${NC}"
-    echo -e "  ${DIM}iMessage extraction works without Docker${NC}"
+    echo ""
+    echo -e "${YELLOW}Docker is not installed.${NC}"
+    echo "Docker is required for WhatsApp extraction (iMessage works without it)."
+    echo ""
+    read -p "Install Docker Desktop via Homebrew? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo -e "${DIM}Installing Docker Desktop...${NC}"
+        brew install --cask docker
+        echo -e "${GREEN}ok${NC} Docker Desktop installed"
+        echo -e "${DIM}Open Docker Desktop from Applications to complete setup before using WhatsApp extraction.${NC}"
+    else
+        echo -e "${DIM}Skipped. Install later with: brew install --cask docker${NC}"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
