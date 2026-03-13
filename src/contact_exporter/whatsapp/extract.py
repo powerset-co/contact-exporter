@@ -174,10 +174,13 @@ def _wait_for_qr_auth(timeout: int = 120):
                 headers=_WAHA_HEADERS, timeout=10,
             )
             if resp.status_code != 200:
+                console.print(f"[dim]Session check: HTTP {resp.status_code}[/dim]")
                 time.sleep(2)
                 continue
 
-            status = resp.json().get("status", "")
+            session_data = resp.json()
+            status = session_data.get("status", "")
+            console.print(f"[dim]Session status: {status}[/dim]")
 
             if status == "WORKING":
                 console.print("\n[green bold]✅ WhatsApp authenticated![/green bold]\n")
@@ -187,9 +190,9 @@ def _wait_for_qr_auth(timeout: int = 120):
                 console.print("[red]WhatsApp session failed. Try again.[/red]")
                 raise SystemExit(1)
 
-            # WhatsApp QR codes expire after ~20s, so refresh every 15s
+            # Try to fetch QR on any non-terminal status, not just specific ones
             needs_refresh = (time.time() - last_qr_time) > 15
-            if needs_refresh and status in ("STARTING", "SCAN_QR_CODE"):
+            if needs_refresh and status not in ("WORKING", "FAILED"):
                 qr_resp = requests.get(
                     f"{_WAHA_BASE}/api/{WAHA_SESSION_NAME}/auth/qr",
                     params={"format": "raw"},
@@ -206,9 +209,11 @@ def _wait_for_qr_auth(timeout: int = 120):
                         qr.print_ascii()
                         last_qr_value = qr_value
                         last_qr_time = time.time()
+                elif not last_qr_value:
+                    console.print(f"[dim]QR not ready yet (HTTP {qr_resp.status_code})[/dim]")
 
         except requests.ConnectionError:
-            pass  # Container still starting up
+            console.print("[dim]Waiting for WAHA...[/dim]")
 
         time.sleep(3)
 
