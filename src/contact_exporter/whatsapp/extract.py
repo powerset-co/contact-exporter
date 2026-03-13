@@ -92,6 +92,7 @@ def _start_container():
     result = subprocess.run(
         [
             "docker", "run", "-d",
+            "--platform", "linux/amd64",
             "--name", WAHA_CONTAINER_NAME,
             "-p", f"127.0.0.1:{WAHA_PORT}:3000",
             "-e", "WAHA_DEFAULT_ENGINE=NOWEB",
