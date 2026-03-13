@@ -100,7 +100,7 @@ def _start_container():
             "-e", f"WAHA_API_KEY={WAHA_API_KEY}",
             "devlikeapro/waha:latest",
         ],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=300,
     )
     if result.returncode != 0:
         console.print(f"[red]Failed to start WAHA: {result.stderr.strip()}[/red]")
@@ -129,7 +129,7 @@ def _is_session_authenticated() -> bool:
         return False
 
 
-def _wait_for_healthy(timeout: int = 90):
+def _wait_for_healthy(timeout: int = 180):
     """Block until WAHA is ready to accept API requests."""
     deadline = time.time() + timeout
     with console.status("[bold]Waiting for WAHA to start..."):
