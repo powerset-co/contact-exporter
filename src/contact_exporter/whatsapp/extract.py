@@ -171,7 +171,7 @@ def _wait_for_qr_auth(timeout: int = 120):
         try:
             resp = requests.get(
                 f"{_WAHA_BASE}/api/sessions/{WAHA_SESSION_NAME}",
-                headers=_WAHA_HEADERS, timeout=10,
+                headers=_WAHA_HEADERS, timeout=30,
             )
             if resp.status_code != 200:
                 console.print(f"[dim]Session check: HTTP {resp.status_code}[/dim]")
@@ -196,7 +196,7 @@ def _wait_for_qr_auth(timeout: int = 120):
                 qr_resp = requests.get(
                     f"{_WAHA_BASE}/api/{WAHA_SESSION_NAME}/auth/qr",
                     params={"format": "raw"},
-                    headers=_WAHA_HEADERS, timeout=10,
+                    headers=_WAHA_HEADERS, timeout=30,
                 )
                 if qr_resp.status_code == 200:
                     qr_data = qr_resp.json()
@@ -212,8 +212,8 @@ def _wait_for_qr_auth(timeout: int = 120):
                 elif not last_qr_value:
                     console.print(f"[dim]QR not ready yet (HTTP {qr_resp.status_code})[/dim]")
 
-        except requests.ConnectionError:
-            console.print("[dim]Waiting for WAHA...[/dim]")
+        except requests.RequestException as e:
+            console.print(f"[dim]Waiting for WAHA... ({type(e).__name__})[/dim]")
 
         time.sleep(3)
 
