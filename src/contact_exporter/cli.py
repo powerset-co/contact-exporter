@@ -58,7 +58,7 @@ def cmd_imessage(args):
 
 
 def cmd_whatsapp(args):
-    extract_whatsapp(output_path=args.output)
+    extract_whatsapp(output_path=args.output, reset=args.reset)
 
 
 def cmd_review(args):
@@ -91,6 +91,7 @@ def main():
 
     wa_parser = subparsers.add_parser("whatsapp", help="Extract WhatsApp contacts via Docker")
     wa_parser.add_argument("--output", "-o", default="contacts.csv", help="Output file path")
+    wa_parser.add_argument("--reset", action="store_true", help="Clear existing session and start fresh")
 
     review_parser = subparsers.add_parser("review", help="Review contacts interactively before upload")
     review_parser.add_argument("--file", "-f", default="contacts.csv", help="CSV file to review")

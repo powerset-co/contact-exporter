@@ -14,11 +14,14 @@ import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import qrcode as qrcode_lib
 import requests
 from rich.console import Console
+from rich.live import Live
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from rich.text import Text
 
 from contact_exporter.config import (
     MAX_CONTACTS_OUTPUT,
@@ -39,9 +42,40 @@ _MIN_REQUEST_INTERVAL = 0.5
 _WAHA_HEADERS = {"X-Api-Key": WAHA_API_KEY}
 _WAHA_BASE = f"http://localhost:{WAHA_PORT}"
 
+# Persistent session storage — survives container restarts
+_SESSIONS_DIR = Path.home() / ".powerset" / "waha-sessions"
+
 # E.164 phone numbers: 7-15 digits
 _MIN_PHONE_DIGITS = 7
 _MAX_PHONE_DIGITS = 15
+
+
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+def _waha_get(url: str, retries: int = 3, backoff: float = 2.0, **kwargs) -> requests.Response:
+    """GET with retries and exponential backoff for slow Rosetta responses."""
+    kwargs.setdefault("headers", _WAHA_HEADERS)
+    kwargs.setdefault("timeout", 60)
+    last_exc: requests.RequestException | None = None
+    for attempt in range(retries):
+        try:
+            time.sleep(_MIN_REQUEST_INTERVAL)
+            resp = requests.get(url, **kwargs)
+            if resp.status_code < 500:
+                return resp
+            # 5xx → retry
+            console.print(f"[dim]Server error {resp.status_code}, retrying...[/dim]")
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < retries - 1:
+                wait = backoff ** attempt
+                console.print(f"[dim]{type(e).__name__}, retrying in {wait:.0f}s...[/dim]")
+                time.sleep(wait)
+    if last_exc:
+        raise last_exc
+    return resp  # type: ignore[possibly-undefined]
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +106,8 @@ def _check_docker_installed():
         time.sleep(2)
 
     console.print("[red bold]Docker did not start in time[/red bold]")
-    console.print("Open Docker Desktop manually and try again.")
+    console.print("Open Docker Desktop manually and complete first-time setup.")
+    console.print("[dim]If this is a fresh install, you need to accept the EULA first.[/dim]")
     raise SystemExit(1)
 
 
@@ -85,8 +120,15 @@ def _is_container_running() -> bool:
 
 
 def _start_container():
-    """Start a fresh WAHA Docker container, removing any existing one."""
+    """Start a fresh WAHA Docker container, removing any existing one.
+
+    Mounts ~/.powerset/waha-sessions to /app/.sessions so WhatsApp credentials
+    persist across container restarts (no re-scanning QR every time).
+    """
     subprocess.run(["docker", "rm", "-f", WAHA_CONTAINER_NAME], capture_output=True, timeout=10)
+
+    # Ensure session storage directory exists on host
+    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     console.print("[dim]Starting WAHA container...[/dim]")
     result = subprocess.run(
@@ -95,6 +137,7 @@ def _start_container():
             "--platform", "linux/amd64",
             "--name", WAHA_CONTAINER_NAME,
             "-p", f"127.0.0.1:{WAHA_PORT}:3000",
+            "-v", f"{_SESSIONS_DIR}:/app/.sessions",
             "-e", "WAHA_DEFAULT_ENGINE=NOWEB",
             "-e", "WHATSAPP_RESTART_ALL_SESSIONS=true",
             "-e", f"WAHA_API_KEY={WAHA_API_KEY}",
@@ -112,6 +155,34 @@ def _start_container():
 def _stop_container():
     console.print("[dim]Stopping WAHA container...[/dim]")
     subprocess.run(["docker", "rm", "-f", WAHA_CONTAINER_NAME], capture_output=True, timeout=15)
+
+
+# ---------------------------------------------------------------------------
+# QR code rendering
+# ---------------------------------------------------------------------------
+
+def _render_qr_to_terminal(data: str) -> Text:
+    """Render a QR code using Rich styled backgrounds.
+
+    Uses explicit black/white background colors on spaces — no half-block
+    Unicode chars that break with terminal line spacing.
+    Returns a Text object for use with Rich Live display.
+    """
+    qr = qrcode_lib.QRCode(
+        border=2,
+        error_correction=qrcode_lib.constants.ERROR_CORRECT_L,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+
+    output = Text()
+    matrix = qr.get_matrix()
+    for i, row in enumerate(matrix):
+        for cell in row:
+            output.append(" ", style="on black" if cell else "on white")
+        if i < len(matrix) - 1:
+            output.append("\n")
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -135,10 +206,10 @@ def _wait_for_healthy(timeout: int = 180):
     with console.status("[bold]Waiting for WAHA to start..."):
         while time.time() < deadline:
             try:
-                resp = requests.get(f"{_WAHA_BASE}/api/sessions", headers=_WAHA_HEADERS, timeout=5)
+                resp = requests.get(f"{_WAHA_BASE}/api/sessions", headers=_WAHA_HEADERS, timeout=15)
                 if resp.status_code == 200:
                     return
-            except requests.ConnectionError:
+            except requests.RequestException:
                 pass
             time.sleep(1)
 
@@ -146,76 +217,128 @@ def _wait_for_healthy(timeout: int = 180):
     raise SystemExit(1)
 
 
+def _stop_session():
+    """Stop and delete the WAHA session to clear stale state."""
+    try:
+        requests.put(
+            f"{_WAHA_BASE}/api/sessions/{WAHA_SESSION_NAME}/stop",
+            headers=_WAHA_HEADERS, timeout=10,
+        )
+    except requests.RequestException:
+        pass
+    try:
+        requests.delete(
+            f"{_WAHA_BASE}/api/sessions/{WAHA_SESSION_NAME}",
+            headers=_WAHA_HEADERS, timeout=10,
+        )
+    except requests.RequestException:
+        pass
+
+
 def _create_session():
+    """Create a fresh WAHA session, cleaning up any stale one first."""
+    # Clean up any existing session to avoid 422 / stale state
+    _stop_session()
+    time.sleep(1)
+
     resp = requests.post(
         f"{_WAHA_BASE}/api/sessions/start",
         json={"name": WAHA_SESSION_NAME},
         headers=_WAHA_HEADERS, timeout=15,
     )
-    # 422 = session already exists, which is fine
-    if resp.status_code not in (200, 201, 422):
+    if resp.status_code == 422:
+        # Session still lingering — force delete and retry
+        console.print("[dim]Clearing stale session...[/dim]")
+        _stop_session()
+        time.sleep(2)
+        resp = requests.post(
+            f"{_WAHA_BASE}/api/sessions/start",
+            json={"name": WAHA_SESSION_NAME},
+            headers=_WAHA_HEADERS, timeout=15,
+        )
+
+    if resp.status_code not in (200, 201):
         console.print(f"[red]Failed to create session: {resp.status_code} {resp.text}[/red]")
         raise SystemExit(1)
 
 
+def _build_qr_display(qr_text: Text | None, status: str, remaining: int) -> Text:
+    """Build the full QR display panel for Rich Live."""
+    output = Text()
+    output.append("Scan the QR code with WhatsApp on your phone\n", style="bold")
+    output.append("WhatsApp > Settings > Linked Devices > Link a Device\n\n", style="dim")
+
+    if qr_text:
+        output.append_text(qr_text)
+        output.append("\n")
+    else:
+        output.append("Waiting for QR code...\n", style="dim")
+
+    output.append(f"\nStatus: {status}  ({remaining}s remaining)", style="dim")
+    return output
+
+
 def _wait_for_qr_auth(timeout: int = 120):
-    """Display QR codes and wait for the user to scan one with WhatsApp."""
+    """Display QR code and wait for the user to scan it.
+
+    Uses Rich Live to update the display in-place — no scrolling.
+    """
     deadline = time.time() + timeout
     last_qr_value = None
     last_qr_time = 0.0
+    qr_text: Text | None = None
 
-    console.print("\n[bold]Scan the QR code with WhatsApp on your phone:[/bold]")
-    console.print("[dim]WhatsApp > Settings > Linked Devices > Link a Device[/dim]\n")
-
-    while time.time() < deadline:
-        try:
-            resp = requests.get(
-                f"{_WAHA_BASE}/api/sessions/{WAHA_SESSION_NAME}",
-                headers=_WAHA_HEADERS, timeout=30,
-            )
-            if resp.status_code != 200:
-                console.print(f"[dim]Session check: HTTP {resp.status_code}[/dim]")
-                time.sleep(2)
-                continue
-
-            session_data = resp.json()
-            status = session_data.get("status", "")
-            console.print(f"[dim]Session status: {status}[/dim]")
-
-            if status == "WORKING":
-                console.print("\n[green bold]✅ WhatsApp authenticated![/green bold]\n")
-                return
-
-            if status == "FAILED":
-                console.print("[red]WhatsApp session failed. Try again.[/red]")
-                raise SystemExit(1)
-
-            # Try to fetch QR on any non-terminal status, not just specific ones
-            needs_refresh = (time.time() - last_qr_time) > 15
-            if needs_refresh and status not in ("WORKING", "FAILED"):
-                qr_resp = requests.get(
-                    f"{_WAHA_BASE}/api/{WAHA_SESSION_NAME}/auth/qr",
-                    params={"format": "raw"},
+    with Live(
+        _build_qr_display(None, "starting", timeout),
+        console=console,
+        refresh_per_second=1,
+    ) as live:
+        while time.time() < deadline:
+            remaining = int(deadline - time.time())
+            try:
+                resp = requests.get(
+                    f"{_WAHA_BASE}/api/sessions/{WAHA_SESSION_NAME}",
                     headers=_WAHA_HEADERS, timeout=30,
                 )
-                if qr_resp.status_code == 200:
-                    qr_data = qr_resp.json()
-                    qr_value = qr_data.get("value") or qr_data.get("qr", "")
-                    if qr_value and qr_value != last_qr_value:
-                        if last_qr_value:
-                            console.print("[dim]QR expired, refreshing...[/dim]\n")
-                        qr = qrcode_lib.QRCode(border=1)
-                        qr.add_data(qr_value)
-                        qr.print_ascii()
-                        last_qr_value = qr_value
-                        last_qr_time = time.time()
-                elif not last_qr_value:
-                    console.print(f"[dim]QR not ready yet (HTTP {qr_resp.status_code})[/dim]")
+                if resp.status_code != 200:
+                    live.update(_build_qr_display(qr_text, f"HTTP {resp.status_code}", remaining))
+                    time.sleep(2)
+                    continue
 
-        except requests.RequestException as e:
-            console.print(f"[dim]Waiting for WAHA... ({type(e).__name__})[/dim]")
+                session_data = resp.json()
+                status = session_data.get("status", "")
 
-        time.sleep(3)
+                if status == "WORKING":
+                    live.update(Text("✅ WhatsApp authenticated!", style="green bold"))
+                    time.sleep(1)
+                    return
+
+                if status == "FAILED":
+                    live.update(Text("❌ WhatsApp session failed.", style="red bold"))
+                    raise SystemExit(1)
+
+                # Fetch QR on any non-terminal status
+                needs_refresh = (time.time() - last_qr_time) > 15
+                if needs_refresh and status not in ("WORKING", "FAILED"):
+                    qr_resp = requests.get(
+                        f"{_WAHA_BASE}/api/{WAHA_SESSION_NAME}/auth/qr",
+                        params={"format": "raw"},
+                        headers=_WAHA_HEADERS, timeout=30,
+                    )
+                    if qr_resp.status_code == 200:
+                        qr_data = qr_resp.json()
+                        qr_value = qr_data.get("value") or qr_data.get("qr", "")
+                        if qr_value and qr_value != last_qr_value:
+                            qr_text = _render_qr_to_terminal(qr_value)
+                            last_qr_value = qr_value
+                            last_qr_time = time.time()
+
+                live.update(_build_qr_display(qr_text, status, remaining))
+
+            except requests.RequestException as e:
+                live.update(_build_qr_display(qr_text, f"waiting ({type(e).__name__})", remaining))
+
+            time.sleep(3)
 
     console.print("[red]QR scan timed out. Try again.[/red]")
     raise SystemExit(1)
@@ -256,12 +379,10 @@ def _jid_to_phone(jid: str) -> str | None:
 
 def _get_chat_message_count(chat_id: str) -> int:
     """Count messages in a 1:1 chat, capped at MESSAGE_COUNT_CAP."""
-    time.sleep(_MIN_REQUEST_INTERVAL)
     try:
-        resp = requests.get(
+        resp = _waha_get(
             f"{_WAHA_BASE}/api/{WAHA_SESSION_NAME}/chats/{chat_id}/messages",
             params={"limit": MESSAGE_COUNT_CAP + 1, "downloadMedia": "false"},
-            headers=_WAHA_HEADERS, timeout=30,
         )
         if resp.status_code == 200:
             messages = resp.json()
@@ -300,17 +421,14 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
 
     # Fetch all chats
     console.print("[dim]Fetching chats...[/dim]")
-    time.sleep(_MIN_REQUEST_INTERVAL)
-    chats_resp = requests.get(f"{_WAHA_BASE}/api/{session}/chats", headers=_WAHA_HEADERS, timeout=30)
+    chats_resp = _waha_get(f"{_WAHA_BASE}/api/{session}/chats")
     chats = chats_resp.json() if chats_resp.status_code == 200 else []
 
     # Fetch contacts for name resolution + @lid -> phone mapping
     console.print("[dim]Fetching contacts...[/dim]")
-    time.sleep(_MIN_REQUEST_INTERVAL)
-    contacts_resp = requests.get(
+    contacts_resp = _waha_get(
         f"{_WAHA_BASE}/api/contacts/all",
         params={"session": session},
-        headers=_WAHA_HEADERS, timeout=30,
     )
     raw_contacts = contacts_resp.json() if contacts_resp.status_code == 200 else []
 
@@ -428,19 +546,31 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def extract_whatsapp(output_path: str = "contacts.csv") -> int:
+def extract_whatsapp(output_path: str = "contacts.csv", reset: bool = False) -> int:
     """Extract WhatsApp contacts via a local WAHA Docker container.
 
     Reuses an existing container if already running and authenticated.
     Merges results with any existing contacts.csv.
+
+    Args:
+        reset: If True, tear down any existing container and start fresh.
 
     Returns the number of contacts written.
     """
     _check_docker_installed()
     console.print("[bold]Extracting WhatsApp contacts...[/bold]")
 
+    if reset:
+        console.print("[yellow]Resetting WhatsApp session...[/yellow]")
+        _stop_container()
+        # Clear persisted session credentials so we get a fresh QR
+        if _SESSIONS_DIR.exists():
+            shutil.rmtree(_SESSIONS_DIR)
+            console.print("[dim]Cleared saved session data[/dim]")
+        time.sleep(1)
+
     started_new = False
-    if _is_container_running() and _is_session_authenticated():
+    if not reset and _is_container_running() and _is_session_authenticated():
         console.print("[dim]Reusing existing WAHA session[/dim]\n")
     else:
         console.print("[dim]Starting local WAHA container (Docker)[/dim]\n")
@@ -471,7 +601,7 @@ def extract_whatsapp(output_path: str = "contacts.csv") -> int:
 
         return total_written
 
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         if started_new:
             _stop_container()
         raise
