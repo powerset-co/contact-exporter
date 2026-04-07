@@ -87,6 +87,10 @@ def _clean_contact_name(first: str, last: str) -> str:
       - "/N" disambiguation suffixes (e.g. "Joy/1" → "Joy")
       - "Last;First" ordering (e.g. "Chao;Joy" → "Joy Chao")
     """
+    # Strip /N sync suffixes before combining (e.g. "Joy/1" → "Joy")
+    first = re.sub(r"/\d+$", "", first).strip()
+    last = re.sub(r"/\d+$", "", last).strip()
+
     if first and last:
         name = f"{first} {last}"
     elif first:
@@ -95,9 +99,6 @@ def _clean_contact_name(first: str, last: str) -> str:
         name = last
     else:
         return ""
-
-    # Strip /N sync suffix (e.g. "Joy/1" → "Joy")
-    name = re.sub(r"/\d+$", "", name)
 
     # Parse Last;First format (e.g. "Li;David" → "David Li")
     if ";" in name:
