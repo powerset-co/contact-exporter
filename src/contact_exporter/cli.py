@@ -20,6 +20,7 @@ from contact_exporter import __version__
 from contact_exporter.auth.credentials import clear_credentials, get_credentials_info
 from contact_exporter.auth.oauth import login
 from contact_exporter.imessage.extract import extract_imessage
+from contact_exporter.llm_review import review_contacts_llm
 from contact_exporter.review import review_contacts
 from contact_exporter.upload import upload_contacts
 from contact_exporter.whatsapp.extract import extract_whatsapp
@@ -61,6 +62,15 @@ def cmd_whatsapp(args):
     extract_whatsapp(output_path=args.output, reset=args.reset)
 
 
+def cmd_llm_review(args):
+    review_contacts_llm(
+        csv_path=args.file,
+        api_key=args.api_key,
+        model=args.model,
+        dry_run=args.dry_run,
+    )
+
+
 def cmd_review(args):
     review_contacts(file_path=args.file)
 
@@ -93,6 +103,12 @@ def main():
     wa_parser.add_argument("--output", "-o", default="contacts.csv", help="Output file path")
     wa_parser.add_argument("--reset", action="store_true", help="Clear existing session and start fresh")
 
+    llm_parser = subparsers.add_parser("llm-review", help="LLM-powered contact review (ENRICH/SKIP)")
+    llm_parser.add_argument("--file", "-f", default="contacts.csv", help="CSV file to review")
+    llm_parser.add_argument("--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
+    llm_parser.add_argument("--model", default="openai/gpt-4.1-mini", help="Model to use")
+    llm_parser.add_argument("--dry-run", action="store_true", help="Estimate cost without calling API")
+
     review_parser = subparsers.add_parser("review", help="Review contacts interactively before upload")
     review_parser.add_argument("--file", "-f", default="contacts.csv", help="CSV file to review")
 
@@ -110,6 +126,7 @@ def main():
         "whoami": cmd_whoami,
         "imessage": cmd_imessage,
         "whatsapp": cmd_whatsapp,
+        "llm-review": cmd_llm_review,
         "review": cmd_review,
         "upload": cmd_upload,
     }
