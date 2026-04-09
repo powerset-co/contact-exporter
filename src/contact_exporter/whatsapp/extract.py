@@ -212,7 +212,9 @@ def _render_qr_to_terminal(data: str) -> Text:
     matrix = qr.get_matrix()
     for i, row in enumerate(matrix):
         for cell in row:
-            output.append(" ", style="on black" if cell else "on white")
+            # 2 spaces per module — terminal chars are ~2:1 height:width,
+            # so 2 spaces makes each module roughly square (scannable)
+            output.append("  ", style="on black" if cell else "on white")
         if i < len(matrix) - 1:
             output.append("\n")
     return output
@@ -274,9 +276,22 @@ def _create_session():
     _stop_session()
     time.sleep(1)
 
+    # NOWEB store must be enabled to fetch chats/contacts (required since WAHA 2026.3+)
+    session_config = {
+        "name": WAHA_SESSION_NAME,
+        "config": {
+            "noweb": {
+                "store": {
+                    "enabled": True,
+                    "full_sync": True,
+                }
+            }
+        },
+    }
+
     resp = requests.post(
         f"{_WAHA_BASE}/api/sessions/start",
-        json={"name": WAHA_SESSION_NAME},
+        json=session_config,
         headers=_WAHA_HEADERS, timeout=15,
     )
     if resp.status_code == 422:
@@ -286,7 +301,7 @@ def _create_session():
         time.sleep(2)
         resp = requests.post(
             f"{_WAHA_BASE}/api/sessions/start",
-            json={"name": WAHA_SESSION_NAME},
+            json=session_config,
             headers=_WAHA_HEADERS, timeout=15,
         )
 
