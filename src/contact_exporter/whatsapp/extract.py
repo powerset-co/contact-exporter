@@ -40,7 +40,7 @@ console = Console()
 _MIN_REQUEST_INTERVAL = 0.5
 
 _WAHA_HEADERS = {"X-Api-Key": WAHA_API_KEY}
-_WAHA_BASE = f"http://localhost:{WAHA_PORT}"
+_WAHA_BASE = f"http://127.0.0.1:{WAHA_PORT}"
 
 # Persistent session storage — survives container restarts
 _SESSIONS_DIR = Path.home() / ".powerset" / "waha-sessions"
@@ -133,6 +133,9 @@ def _is_container_running() -> bool:
     return result.returncode == 0 and "true" in result.stdout.lower()
 
 
+_WAHA_IMAGE = "devlikeapro/waha:noweb-2026.3.4"
+
+
 def _start_container():
     """Start a fresh WAHA Docker container, removing any existing one.
 
@@ -143,6 +146,21 @@ def _start_container():
 
     # Ensure session storage directory exists on host
     _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Pull image separately so the user sees download progress
+    check = subprocess.run(
+        ["docker", "image", "inspect", _WAHA_IMAGE],
+        capture_output=True, timeout=10,
+    )
+    if check.returncode != 0:
+        console.print(f"[dim]Pulling {_WAHA_IMAGE}...[/dim]")
+        pull = subprocess.run(
+            ["docker", "pull", "--platform", "linux/amd64", _WAHA_IMAGE],
+            timeout=600,
+        )
+        if pull.returncode != 0:
+            console.print("[red]Failed to pull WAHA image[/red]")
+            raise SystemExit(1)
 
     console.print("[dim]Starting WAHA container...[/dim]")
     result = subprocess.run(
@@ -156,7 +174,7 @@ def _start_container():
             "-e", "WHATSAPP_DEFAULT_ENGINE=NOWEB",
             "-e", "WHATSAPP_RESTART_ALL_SESSIONS=true",
             "-e", f"WAHA_API_KEY={WAHA_API_KEY}",
-            "devlikeapro/waha:noweb-2026.3.4",
+            _WAHA_IMAGE,
         ],
         capture_output=True, text=True, timeout=300,
     )
