@@ -198,7 +198,7 @@ if [[ -n "$CE_EXISTING" ]] && [[ "$CE_EXISTING" != *"/homebrew/"* ]] && [[ "$CE_
 fi
 
 # ---------------------------------------------------------------------------
-# Install / upgrade contact-exporter + imsg
+# Install / upgrade contact-exporter
 # ---------------------------------------------------------------------------
 
 echo ""
@@ -239,14 +239,7 @@ if [[ "$USE_BREW" == true ]]; then
         echo ""
     fi
 
-    # imsg: iMessage extraction CLI (reads ~/Library/Messages/chat.db)
-    if command -v imsg &>/dev/null; then
-        echo -e "${GREEN}ok${NC} imsg"
-    else
-        echo -e "${DIM}Installing imsg (iMessage extraction)...${NC}"
-        brew install steipete/tap/imsg
-        echo -e "${GREEN}ok${NC} imsg"
-    fi
+    # imsg no longer needed — we read chat.db directly via SQLite
 
 else
     # --- Pip fallback for old macOS ---
@@ -278,7 +271,7 @@ else
         fi
     fi
 
-    echo -e "${DIM}imsg requires Homebrew — iMessage names may be missing on this macOS version${NC}"
+    # No external dependencies needed — chat.db and AddressBook are read directly via SQLite
 fi
 
 # ---------------------------------------------------------------------------

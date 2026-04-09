@@ -1,17 +1,15 @@
-"""iMessage contact extraction via the `imsg` CLI.
+"""iMessage contact extraction via direct SQLite reads.
 
-Wraps steipete/imsg (https://github.com/steipete/imsg) to read
-~/Library/Messages/chat.db and extract contact metadata.
-
+Reads ~/Library/Messages/chat.db directly to extract contact metadata.
 Only counts messages -- never reads or exports message content.
+
+Works on both Intel and Apple Silicon (no external binary dependencies).
 """
 
 from __future__ import annotations
 
 import glob
-import json
 import re
-import shutil
 import sqlite3
 import subprocess
 import time
@@ -27,6 +25,16 @@ from contact_exporter.merge import load_existing_contacts, merge_contact, write_
 from contact_exporter.models import Contact
 
 console = Console()
+
+# ---------------------------------------------------------------------------
+# Paths & constants
+# ---------------------------------------------------------------------------
+
+_CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
+
+# Apple epoch: Jan 1, 2001 00:00:00 UTC (timestamps are nanoseconds since this)
+_APPLE_EPOCH_OFFSET = 978_307_200
+_NS_PER_SEC = 1_000_000_000
 
 # AddressBook SQLite databases — one per sync source (iCloud, local, Exchange, etc.)
 _ADDRESSBOOK_GLOB = str(
@@ -67,6 +75,34 @@ end tell
 '''
 
 
+# ---------------------------------------------------------------------------
+# Timestamp helpers
+# ---------------------------------------------------------------------------
+
+def _apple_ns_to_unix(ns: int | None) -> float | None:
+    """Convert Apple nanosecond timestamp to Unix epoch seconds."""
+    if not ns:
+        return None
+    return (ns / _NS_PER_SEC) + _APPLE_EPOCH_OFFSET
+
+
+def _apple_ns_to_iso(ns: int | None) -> str | None:
+    """Convert Apple nanosecond timestamp to ISO 8601 string."""
+    unix_ts = _apple_ns_to_unix(ns)
+    if unix_ts is None:
+        return None
+    return datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
+
+
+def _datetime_to_apple_ns(dt: datetime) -> int:
+    """Convert a datetime to Apple nanosecond timestamp."""
+    return int((dt.timestamp() - _APPLE_EPOCH_OFFSET) * _NS_PER_SEC)
+
+
+# ---------------------------------------------------------------------------
+# Phone number helpers
+# ---------------------------------------------------------------------------
+
 def _normalize_phone(raw: str) -> str:
     """Normalize a phone number to 10 digits for lookup matching.
 
@@ -80,6 +116,25 @@ def _normalize_phone(raw: str) -> str:
     return digits
 
 
+def _is_phone_identifier(identifier: str) -> bool:
+    """Check if a chat identifier looks like a phone number (not email/URN/group)."""
+    if not identifier or "@" in identifier or identifier.startswith("urn:"):
+        return False
+    if identifier.startswith("chat"):
+        return False
+    digits = re.sub(r"[^\d]", "", identifier)
+    return len(digits) >= 7
+
+
+def _is_group_identifier(identifier: str) -> bool:
+    """Check if a chat identifier is a group chat."""
+    return identifier.startswith("chat")
+
+
+# ---------------------------------------------------------------------------
+# Contact name lookup
+# ---------------------------------------------------------------------------
+
 def _clean_contact_name(first: str, last: str) -> str:
     """Clean up a contact name from AddressBook fields.
 
@@ -87,7 +142,6 @@ def _clean_contact_name(first: str, last: str) -> str:
       - "/N" disambiguation suffixes (e.g. "Joy/1" → "Joy")
       - "Last;First" ordering (e.g. "Chao;Joy" → "Joy Chao")
     """
-    # Strip /N sync suffixes before combining (e.g. "Joy/1" → "Joy")
     first = re.sub(r"/\d+$", "", first).strip()
     last = re.sub(r"/\d+$", "", last).strip()
 
@@ -100,7 +154,6 @@ def _clean_contact_name(first: str, last: str) -> str:
     else:
         return ""
 
-    # Parse Last;First format (e.g. "Li;David" → "David Li")
     if ";" in name:
         parts = name.split(";", 1)
         name = f"{parts[1]} {parts[0]}"
@@ -123,11 +176,7 @@ def _add_phone_to_lookup(lookup: dict[str, str], phone_raw: str, name: str) -> N
 
 
 def _query_contacts_sqlite() -> dict[str, str]:
-    """Read phone→name mappings directly from AddressBook SQLite databases.
-
-    ~3800x faster than AppleScript (0.02s vs 38s for ~700 contacts).
-    Reads all sync sources (iCloud, local, Exchange, etc.).
-    """
+    """Read phone→name mappings directly from AddressBook SQLite databases."""
     db_paths = glob.glob(_ADDRESSBOOK_GLOB)
     if not db_paths:
         return {}
@@ -179,13 +228,11 @@ def _build_contact_name_lookup() -> dict[str, str]:
 
     Tries direct SQLite read first (fast), falls back to AppleScript.
     """
-    # Fast path: read AddressBook databases directly
     lookup = _query_contacts_sqlite()
     if lookup:
         console.print(f"[dim]Loaded {len(lookup)} contacts from AddressBook database[/dim]")
         return lookup
 
-    # Fallback: AppleScript (if SQLite unavailable or locked)
     console.print("[dim]SQLite read failed, falling back to AppleScript...[/dim]")
     lookup = _query_contacts_applescript()
     if lookup:
@@ -196,149 +243,134 @@ def _build_contact_name_lookup() -> dict[str, str]:
     return lookup
 
 
-def _check_imsg_installed() -> str:
-    """Check that the imsg CLI is on PATH. Returns path or exits."""
-    path = shutil.which("imsg")
-    if not path:
-        console.print("[red bold]imsg CLI not found[/red bold]")
-        console.print()
-        console.print("Install imsg to extract iMessage contacts:")
-        console.print("  [cyan]brew install steipete/tap/imsg[/cyan]")
-        console.print("  or build from source: [dim]https://github.com/steipete/imsg[/dim]")
-        raise SystemExit(1)
-    return path
-
+# ---------------------------------------------------------------------------
+# Permissions check
+# ---------------------------------------------------------------------------
 
 def _check_full_disk_access() -> bool:
     """Check if we can read chat.db (requires Full Disk Access)."""
     try:
-        result = subprocess.run(
-            ["imsg", "chats", "--limit", "1", "--json"],
-            capture_output=True, text=True, timeout=10,
-        )
-        error_output = (result.stderr.strip() or result.stdout.strip()).lower()
-        if result.returncode != 0 and (
-            "permissiondenied" in error_output.replace(" ", "")
-            or "authorization denied" in error_output
-        ):
-            return False
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        return True  # Slow but not a permission issue
-
-
-def _check_contacts_access() -> bool:
-    """Check if we have Contacts.app access via a minimal AppleScript query."""
-    try:
-        result = subprocess.run(
-            ["osascript", "-e",
-             'tell application "Contacts" to launch\n'
-             'delay 1\n'
-             'tell application "Contacts" to count every person'],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.lower()
-            if "not authorized" in stderr or "denied" in stderr:
-                return False
-            # Other errors (app slow to start) -- assume OK, will fail later with a clear message
-            return True
-        return result.stdout.strip().isdigit()
-    except subprocess.TimeoutExpired:
-        return True  # Don't block on timeout
+        conn = sqlite3.connect(f"file:{_CHAT_DB}?mode=ro", uri=True)
+        conn.execute("SELECT 1 FROM chat LIMIT 1")
+        conn.close()
+        return True
+    except sqlite3.Error:
+        return False
 
 
 def _check_permissions():
-    """Verify Full Disk Access and Contacts permissions. Opens System Settings if missing."""
+    """Verify Full Disk Access. Opens System Settings if missing."""
     console.print("[dim]Checking permissions...[/dim]")
 
-    has_fda = _check_full_disk_access()
-    has_contacts = _check_contacts_access()
-
-    if has_fda and has_contacts:
+    if _check_full_disk_access():
         return
 
-    if not has_fda:
-        console.print("[red]❌ Full Disk Access — required to read iMessage history[/red]")
-    if not has_contacts:
-        console.print("[red]❌ Contacts — required to resolve contact names[/red]")
-
+    console.print("[red]❌ Full Disk Access — required to read iMessage history[/red]")
     console.print()
     console.print("[bold]Opening System Settings for you...[/bold]")
-    console.print("Enable your terminal app, then restart your terminal and retry.\n")
+    console.print("Enable your terminal app, then [bold]restart your terminal[/bold] and retry.\n")
 
-    if not has_fda:
-        webbrowser.open("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
-    if not has_contacts:
-        webbrowser.open("x-apple.systempreferences:com.apple.preference.security?Privacy_Contacts")
-
+    webbrowser.open("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
     raise SystemExit(1)
 
 
-def _run_imsg(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
-    return subprocess.run(["imsg"] + args, capture_output=True, text=True, timeout=timeout)
+# ---------------------------------------------------------------------------
+# chat.db queries
+# ---------------------------------------------------------------------------
+
+def _open_chat_db() -> sqlite3.Connection:
+    """Open chat.db read-only."""
+    conn = sqlite3.connect(f"file:{_CHAT_DB}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def _count_jsonl_lines(raw: str) -> int:
-    if not raw.strip():
-        return 0
-    return sum(1 for line in raw.strip().split("\n") if line.strip())
+def _list_conversations(conn: sqlite3.Connection) -> list[dict]:
+    """List all conversations with last message timestamp."""
+    rows = conn.execute("""
+        SELECT c.ROWID AS id,
+               c.chat_identifier AS identifier,
+               c.display_name AS display_name,
+               MAX(m.date) AS last_date
+        FROM chat c
+        JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
+        JOIN message m ON m.ROWID = cmj.message_id
+        GROUP BY c.ROWID
+        ORDER BY last_date DESC
+    """).fetchall()
 
-
-def _count_messages(chat_id: int, start_iso: str) -> int:
-    """Count messages in a chat since start_iso, capped at MESSAGE_COUNT_CAP."""
-    args = [
-        "history", "--chat-id", str(chat_id),
-        "--start", start_iso,
-        "--limit", str(MESSAGE_COUNT_CAP + 1),
-        "--json",
+    return [
+        {
+            "id": row["id"],
+            "identifier": row["identifier"] or "",
+            "display_name": row["display_name"] or "",
+            "last_date_ns": row["last_date"],
+            "last_message_at": _apple_ns_to_iso(row["last_date"]),
+        }
+        for row in rows
     ]
-    try:
-        result = _run_imsg(args, timeout=15)
-        if result.returncode != 0:
-            return 0
-        return min(_count_jsonl_lines(result.stdout), MESSAGE_COUNT_CAP)
-    except subprocess.TimeoutExpired:
-        return 0
 
 
-def _parse_messages(stdout: str):
-    """Yield parsed JSON objects from JSONL output, skipping malformed lines."""
-    for line in stdout.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            yield json.loads(line)
-        except json.JSONDecodeError:
-            continue
+def _count_messages_since(conn: sqlite3.Connection, chat_id: int, since_ns: int) -> int:
+    """Count messages in a chat since a timestamp, capped at MESSAGE_COUNT_CAP.
+
+    Excludes reactions/tapbacks (associated_message_type 2000-3006).
+    """
+    row = conn.execute("""
+        SELECT COUNT(*) AS cnt
+        FROM chat_message_join cmj
+        JOIN message m ON m.ROWID = cmj.message_id
+        WHERE cmj.chat_id = ?
+          AND m.date >= ?
+          AND (m.associated_message_type IS NULL
+               OR m.associated_message_type < 2000
+               OR m.associated_message_type > 3006)
+    """, (chat_id, since_ns)).fetchone()
+
+    return min(row["cnt"], MESSAGE_COUNT_CAP) if row else 0
 
 
-def _extract_group_participants(chat_id: int, start_iso: str) -> dict[str, dict]:
-    """Extract per-sender stats from a group chat.
+def _get_group_participants(conn: sqlite3.Connection, chat_id: int) -> list[str]:
+    """Get phone numbers of group chat participants via chat_handle_join."""
+    rows = conn.execute("""
+        SELECT h.id
+        FROM chat_handle_join chj
+        JOIN handle h ON h.ROWID = chj.handle_id
+        WHERE chj.chat_id = ?
+    """, (chat_id,)).fetchall()
+
+    phones = []
+    for row in rows:
+        handle_id = row["id"] or ""
+        if _is_phone_identifier(handle_id):
+            phones.append(handle_id)
+    return phones
+
+
+def _get_group_sender_stats(
+    conn: sqlite3.Connection, chat_id: int, since_ns: int
+) -> dict[str, dict]:
+    """Get per-sender message counts and last message time for a group chat.
 
     Returns {sender_phone: {"count": int, "last_message": str | None}}.
+    Excludes reactions/tapbacks and messages from self.
     """
-    args = [
-        "history", "--chat-id", str(chat_id),
-        "--start", start_iso,
-        # Fetch more messages for groups since they have multiple senders
-        "--limit", str(MESSAGE_COUNT_CAP * 5),
-        "--json",
-    ]
-    try:
-        result = _run_imsg(args, timeout=30)
-        if result.returncode != 0:
-            return {}
-    except subprocess.TimeoutExpired:
-        return {}
+    rows = conn.execute("""
+        SELECT h.id AS sender, m.date AS msg_date
+        FROM chat_message_join cmj
+        JOIN message m ON m.ROWID = cmj.message_id
+        LEFT JOIN handle h ON m.handle_id = h.ROWID
+        WHERE cmj.chat_id = ?
+          AND m.date >= ?
+          AND m.is_from_me = 0
+          AND (m.associated_message_type IS NULL
+               OR m.associated_message_type < 2000
+               OR m.associated_message_type > 3006)
+    """, (chat_id, since_ns)).fetchall()
 
     participants: dict[str, dict] = {}
-    for msg in _parse_messages(result.stdout):
-        if msg.get("is_from_me"):
-            continue
-
-        sender = msg.get("sender", "")
+    for row in rows:
+        sender = row["sender"] or ""
         if not sender or "@" in sender or sender.startswith("urn:"):
             continue
 
@@ -348,93 +380,61 @@ def _extract_group_participants(chat_id: int, start_iso: str) -> dict[str, dict]
         p = participants[sender]
         p["count"] = min(p["count"] + 1, MESSAGE_COUNT_CAP)
 
-        date_str = msg.get("created_at") or ""
-        if date_str and (p["last_message"] is None or date_str > p["last_message"]):
-            p["last_message"] = date_str
+        iso = _apple_ns_to_iso(row["msg_date"])
+        if iso and (p["last_message"] is None or iso > p["last_message"]):
+            p["last_message"] = iso
 
     return participants
 
 
-def _get_group_participant_phones(chat_id: int, start_iso: str) -> list[str]:
-    """Get unique participant phone numbers from a group chat (no counting)."""
-    args = [
-        "history", "--chat-id", str(chat_id),
-        "--start", start_iso, "--limit", "500", "--json",
-    ]
-    try:
-        result = _run_imsg(args, timeout=20)
-        if result.returncode != 0:
-            return []
-    except subprocess.TimeoutExpired:
-        return []
-
-    phones = set()
-    for msg in _parse_messages(result.stdout):
-        if msg.get("is_from_me"):
-            continue
-        sender = msg.get("sender", "")
-        if sender and "@" not in sender and not sender.startswith("urn:"):
-            phones.add(sender)
-    return list(phones)
-
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bool = False) -> int:
-    """Extract iMessage contacts and write to JSONL.
+    """Extract iMessage contacts via direct SQLite reads of chat.db.
 
-    Reads all conversations from chat.db, counts messages for 1:1 chats,
+    Reads all conversations, counts messages for 1:1 chats,
     flags group chat participants, and outputs the top contacts sorted by
     message count.
 
     Returns the number of contacts written.
     """
-    _check_imsg_installed()
     _check_permissions()
 
     console.print("[bold]Extracting iMessage contacts...[/bold]")
-    console.print("[dim]Reading ~/Library/Messages/chat.db (read-only)[/dim]\n")
+    console.print(f"[dim]Reading {_CHAT_DB} (read-only)[/dim]\n")
+
+    conn = _open_chat_db()
 
     # List all conversations
     console.print("[dim]Listing conversations...[/dim]")
-    try:
-        result = _run_imsg(["chats", "--json", "--limit", "10000"], timeout=60)
-    except subprocess.TimeoutExpired:
-        console.print("[red]Timed out listing conversations[/red]")
-        raise SystemExit(1)
-
-    if result.returncode != 0:
-        console.print(f"[red]imsg error: {result.stderr.strip() or result.stdout.strip()}[/red]")
-        raise SystemExit(1)
-
-    conversations = list(_parse_messages(result.stdout))
+    conversations = _list_conversations(conn)
     if not conversations:
         console.print("[yellow]No conversations found[/yellow]")
+        conn.close()
         return 0
 
-    # Separate 1:1 vs group chats, skip email-based iMessage identifiers
+    # Separate 1:1 vs group chats, skip emails/URNs/short codes
     direct_chats = []
     group_chats = []
     for conv in conversations:
-        identifier = conv.get("identifier") or ""
-        # Skip non-phone identifiers: emails, Apple Business Chat URNs, short codes
-        if not identifier or "@" in identifier or identifier.startswith("urn:"):
-            continue
-        elif identifier.startswith("chat"):
+        identifier = conv["identifier"]
+        if _is_group_identifier(identifier):
             group_chats.append(conv)
-        else:
-            digits_only = re.sub(r"[^\d]", "", identifier)
-            if len(digits_only) < 7:
-                continue
+        elif _is_phone_identifier(identifier):
             direct_chats.append(conv)
 
     console.print(f"[dim]Found {len(direct_chats)} direct + {len(group_chats)} group conversations[/dim]")
 
-    # Build phone -> name lookup from Contacts.app
+    # Build phone → name lookup from Contacts
     console.print("[dim]Loading contacts...[/dim]")
     name_lookup = _build_contact_name_lookup()
     console.print()
 
     now = datetime.now(timezone.utc)
-    start_90 = (now - timedelta(days=90)).strftime("%Y-%m-%dT00:00:00Z")
+    cutoff_90d = now - timedelta(days=90)
+    since_ns = _datetime_to_apple_ns(cutoff_90d)
     contacts_by_phone: dict[str, Contact] = {}
 
     # Count messages for 1:1 chats
@@ -449,27 +449,21 @@ def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bo
 
         for conv in direct_chats:
             progress.advance(task)
-            chat_id = conv.get("id")
-            if chat_id is None:
-                continue
-
-            identifier = conv.get("identifier") or ""
-            last_message_at = conv.get("last_message_at")
+            chat_id = conv["id"]
+            identifier = conv["identifier"]
+            last_message_at = conv["last_message_at"]
             name = name_lookup.get(_normalize_phone(identifier), "")
 
             # Only count messages if the chat had activity in the last 90 days
             count = 0
-            if last_message_at:
-                try:
-                    last_dt = datetime.fromisoformat(last_message_at.replace("Z", "+00:00"))
-                    if last_dt >= now - timedelta(days=90):
-                        count = _count_messages(chat_id, start_90)
-                except (ValueError, TypeError):
-                    count = _count_messages(chat_id, start_90)
+            last_date_ns = conv["last_date_ns"]
+            if last_date_ns:
+                last_unix = _apple_ns_to_unix(last_date_ns)
+                if last_unix and last_unix >= cutoff_90d.timestamp():
+                    count = _count_messages_since(conn, chat_id, since_ns)
             else:
-                count = _count_messages(chat_id, start_90)
+                count = _count_messages_since(conn, chat_id, since_ns)
 
-            # Same phone can have multiple chats (iMessage, SMS, iMessageLite) — merge them
             new_contact = Contact(
                 phone=identifier,
                 name=name,
@@ -494,26 +488,22 @@ def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bo
 
         for conv in group_chats:
             progress.advance(task)
-            chat_id = conv.get("id")
-            if chat_id is None:
-                continue
+            chat_id = conv["id"]
 
             # Skip groups with no activity in 90 days
-            last_message_at = conv.get("last_message_at")
-            if last_message_at:
-                try:
-                    last_dt = datetime.fromisoformat(last_message_at.replace("Z", "+00:00"))
-                    if last_dt < now - timedelta(days=90):
-                        continue
-                except (ValueError, TypeError):
-                    pass
+            last_date_ns = conv["last_date_ns"]
+            if last_date_ns:
+                last_unix = _apple_ns_to_unix(last_date_ns)
+                if last_unix and last_unix < cutoff_90d.timestamp():
+                    continue
 
             if include_small_groups:
-                # --include-small-groups: count per-sender messages in groups <= 7 people
-                participants = _extract_group_participants(chat_id, start_90)
+                participants = _get_group_sender_stats(conn, chat_id, since_ns)
                 is_small = len(participants) <= SMALL_GROUP_MAX_MEMBERS
 
                 for sender_phone, stats in participants.items():
+                    if not _is_phone_identifier(sender_phone):
+                        continue
                     name = name_lookup.get(_normalize_phone(sender_phone), "")
                     if sender_phone in contacts_by_phone:
                         existing = contacts_by_phone[sender_phone]
@@ -540,7 +530,7 @@ def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bo
                         )
             else:
                 # Default: just flag group participants, don't count messages
-                phones = _get_group_participant_phones(chat_id, start_90)
+                phones = _get_group_participants(conn, chat_id)
                 for sender_phone in phones:
                     name = name_lookup.get(_normalize_phone(sender_phone), "")
                     if sender_phone in contacts_by_phone:
@@ -554,6 +544,8 @@ def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bo
                             source="imessage",
                             is_in_group_chats=True,
                         )
+
+    conn.close()
 
     # Merge with existing contacts.csv (preserves WhatsApp data)
     existing = load_existing_contacts(output_path)
