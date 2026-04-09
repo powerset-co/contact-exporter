@@ -112,63 +112,69 @@ else
 fi
 
 # 1. Check/install Homebrew
+MACOS_VER=$(sw_vers -productVersion)
+MACOS_MAJOR=$(echo "$MACOS_VER" | cut -d. -f1)
+USE_BREW=true
+
 if ! command -v brew &>/dev/null; then
-    echo -e "${YELLOW}Homebrew not found. Installing...${NC}"
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    # Add brew to PATH for this session (Apple Silicon vs Intel)
-    if [[ -f /opt/homebrew/bin/brew ]]; then
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-    elif [[ -f /usr/local/bin/brew ]]; then
-        eval "$(/usr/local/bin/brew shellenv)"
+    # macOS < 13 (Ventura): Homebrew may refuse to install
+    if [[ "$MACOS_MAJOR" -lt 13 ]]; then
+        echo -e "${YELLOW}macOS ${MACOS_VER} detected — Homebrew requires macOS 13+${NC}"
+        echo -e "${DIM}Will install via pip instead${NC}"
+        USE_BREW=false
+    else
+        echo -e "${YELLOW}Homebrew not found. Installing...${NC}"
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        # Add brew to PATH for this session (Apple Silicon vs Intel)
+        if [[ -f /opt/homebrew/bin/brew ]]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        elif [[ -f /usr/local/bin/brew ]]; then
+            eval "$(/usr/local/bin/brew shellenv)"
+        fi
+        if ! command -v brew &>/dev/null; then
+            echo -e "${YELLOW}Homebrew installation failed — falling back to pip${NC}"
+            USE_BREW=false
+        else
+            echo -e "${GREEN}ok${NC} Homebrew installed"
+        fi
     fi
-    if ! command -v brew &>/dev/null; then
-        echo -e "${RED}Homebrew installation failed. Please install manually and re-run.${NC}"
-        exit 1
-    fi
-    echo -e "${GREEN}ok${NC} Homebrew installed"
 else
     echo -e "${GREEN}ok${NC} Homebrew"
 fi
 
-# 2. Check/install Docker (required for WhatsApp)
-if command -v docker &>/dev/null; then
+# 2. Check/install Docker runtime (required for WhatsApp)
+if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
     echo -e "${GREEN}ok${NC} Docker"
-else
+elif command -v colima &>/dev/null; then
+    echo -e "${DIM}Starting Colima...${NC}"
+    if [[ "$ARCH" == "arm64" ]]; then
+        colima start --memory 2 --vm-type vz --vz-rosetta 2>/dev/null || colima start --memory 2 2>/dev/null
+    else
+        colima start --memory 2 2>/dev/null
+    fi
+    echo -e "${GREEN}ok${NC} Colima"
+elif [[ "$USE_BREW" == true ]]; then
     echo ""
-    echo -e "${YELLOW}Docker is not installed.${NC}"
-    echo "Docker is required for WhatsApp extraction (iMessage works without it)."
+    echo -e "${YELLOW}Docker runtime not found.${NC}"
+    echo "Required for WhatsApp extraction (iMessage works without it)."
     echo ""
-    read -p "Install Docker Desktop via Homebrew? [y/N] " -n 1 -r
+    read -p "Install Colima (lightweight Docker runtime)? [y/N] " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo -e "${DIM}Installing Docker Desktop...${NC}"
-        brew install --cask docker
-        echo -e "${GREEN}ok${NC} Docker Desktop installed"
-
-        # Docker Desktop must be opened once to accept EULA and finish setup
-        echo ""
-        echo -e "${BOLD}Opening Docker Desktop for first-time setup...${NC}"
-        echo -e "${DIM}Accept the terms and wait for Docker to start (whale icon in menu bar).${NC}"
-        open -a Docker
-
-        # Wait up to 2 minutes for Docker daemon to be ready
-        echo -e "${DIM}Waiting for Docker to be ready...${NC}"
-        DEADLINE=$((SECONDS + 120))
-        while [[ $SECONDS -lt $DEADLINE ]]; do
-            if docker info &>/dev/null 2>&1; then
-                echo -e "${GREEN}ok${NC} Docker is running"
-                break
-            fi
-            sleep 3
-        done
-
-        if ! docker info &>/dev/null 2>&1; then
-            echo -e "${YELLOW}Docker isn't ready yet — it may still be starting.${NC}"
-            echo -e "${DIM}Wait for the whale icon in your menu bar, then run: contact-exporter whatsapp${NC}"
+        echo -e "${DIM}Installing Colima + Docker CLI...${NC}"
+        brew install colima docker
+        echo -e "${DIM}Starting Colima...${NC}"
+        if [[ "$ARCH" == "arm64" ]]; then
+            colima start --memory 2 --vm-type vz --vz-rosetta 2>/dev/null || colima start --memory 2 2>/dev/null
+        else
+            colima start --memory 2 2>/dev/null
         fi
+        echo -e "${GREEN}ok${NC} Colima + Docker"
     else
-        echo -e "${DIM}Skipped. Install later with: brew install --cask docker${NC}"
+        echo -e "${DIM}Skipped. Install later with: brew install colima docker && colima start${NC}"
     fi
+else
+    echo -e "${DIM}Docker unavailable — WhatsApp extraction requires: brew install colima docker${NC}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -197,46 +203,82 @@ fi
 
 echo ""
 
-# Ensure the tap is fresh
-brew tap powerset-co/powerset 2>/dev/null || true
-brew update --quiet 2>/dev/null || true
+if [[ "$USE_BREW" == true ]]; then
+    # --- Homebrew install path ---
 
-# Install or upgrade contact-exporter
-if brew list powerset-co/powerset/contact-exporter &>/dev/null; then
-    INSTALLED_VERSION=$(brew info --json=v2 powerset-co/powerset/contact-exporter 2>/dev/null | \
-        python3 -c "import sys,json; d=json.load(sys.stdin); print(d['formulae'][0]['installed'][0]['version'])" 2>/dev/null || echo "unknown")
-    LATEST_VERSION=$(brew info --json=v2 powerset-co/powerset/contact-exporter 2>/dev/null | \
-        python3 -c "import sys,json; d=json.load(sys.stdin); print(d['formulae'][0]['versions']['stable'])" 2>/dev/null || echo "unknown")
+    # Ensure the tap is fresh
+    brew tap powerset-co/powerset 2>/dev/null || true
+    brew update --quiet 2>/dev/null || true
 
-    if [[ "$INSTALLED_VERSION" != "$LATEST_VERSION" ]]; then
-        echo -e "${YELLOW}Upgrading contact-exporter ${INSTALLED_VERSION} → ${LATEST_VERSION}...${NC}"
-        brew upgrade powerset-co/powerset/contact-exporter 2>/dev/null || brew reinstall powerset-co/powerset/contact-exporter
+    # Install or upgrade contact-exporter
+    if brew list powerset-co/powerset/contact-exporter &>/dev/null; then
+        INSTALLED_VERSION=$(brew info --json=v2 powerset-co/powerset/contact-exporter 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d['formulae'][0]['installed'][0]['version'])" 2>/dev/null || echo "unknown")
+        LATEST_VERSION=$(brew info --json=v2 powerset-co/powerset/contact-exporter 2>/dev/null | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); print(d['formulae'][0]['versions']['stable'])" 2>/dev/null || echo "unknown")
+
+        if [[ "$INSTALLED_VERSION" != "$LATEST_VERSION" ]]; then
+            echo -e "${YELLOW}Upgrading contact-exporter ${INSTALLED_VERSION} → ${LATEST_VERSION}...${NC}"
+            brew upgrade powerset-co/powerset/contact-exporter 2>/dev/null || brew reinstall powerset-co/powerset/contact-exporter
+        else
+            echo -e "${GREEN}ok${NC} contact-exporter ${INSTALLED_VERSION} (up to date)"
+        fi
     else
-        echo -e "${GREEN}ok${NC} contact-exporter ${INSTALLED_VERSION} (up to date)"
+        echo -e "${DIM}Installing contact-exporter via Homebrew...${NC}"
+        brew install powerset-co/powerset/contact-exporter
     fi
-else
-    echo -e "${DIM}Installing contact-exporter via Homebrew...${NC}"
-    brew install powerset-co/powerset/contact-exporter
-fi
-echo -e "${GREEN}ok${NC} contact-exporter"
+    echo -e "${GREEN}ok${NC} contact-exporter"
 
-# Verify the Homebrew binary is what's on PATH
-CE_ON_PATH=$(command -v contact-exporter 2>/dev/null || true)
-if [[ -n "$CE_ON_PATH" ]] && [[ "$CE_ON_PATH" != *"/homebrew/"* ]] && [[ "$CE_ON_PATH" != *"/Cellar/"* ]] && [[ "$CE_ON_PATH" != *"/usr/local/bin/"* ]]; then
-    echo ""
-    echo -e "${YELLOW}⚠️  PATH conflict: ${CE_ON_PATH} is shadowing the Homebrew install${NC}"
-    echo -e "  Expected: $(brew --prefix)/bin/contact-exporter"
-    echo -e "  ${DIM}Fix: remove the old binary or adjust your shell PATH to put Homebrew first${NC}"
-    echo ""
-fi
+    # Verify the Homebrew binary is what's on PATH
+    CE_ON_PATH=$(command -v contact-exporter 2>/dev/null || true)
+    if [[ -n "$CE_ON_PATH" ]] && [[ "$CE_ON_PATH" != *"/homebrew/"* ]] && [[ "$CE_ON_PATH" != *"/Cellar/"* ]] && [[ "$CE_ON_PATH" != *"/usr/local/bin/"* ]]; then
+        echo ""
+        echo -e "${YELLOW}⚠️  PATH conflict: ${CE_ON_PATH} is shadowing the Homebrew install${NC}"
+        echo -e "  Expected: $(brew --prefix)/bin/contact-exporter"
+        echo -e "  ${DIM}Fix: remove the old binary or adjust your shell PATH to put Homebrew first${NC}"
+        echo ""
+    fi
 
-# imsg: iMessage extraction CLI (reads ~/Library/Messages/chat.db)
-if command -v imsg &>/dev/null; then
-    echo -e "${GREEN}ok${NC} imsg"
+    # imsg: iMessage extraction CLI (reads ~/Library/Messages/chat.db)
+    if command -v imsg &>/dev/null; then
+        echo -e "${GREEN}ok${NC} imsg"
+    else
+        echo -e "${DIM}Installing imsg (iMessage extraction)...${NC}"
+        brew install steipete/tap/imsg
+        echo -e "${GREEN}ok${NC} imsg"
+    fi
+
 else
-    echo -e "${DIM}Installing imsg (iMessage extraction)...${NC}"
-    brew install steipete/tap/imsg
-    echo -e "${GREEN}ok${NC} imsg"
+    # --- Pip fallback for old macOS ---
+
+    if ! command -v python3 &>/dev/null; then
+        echo -e "${RED}Python 3 not found. Install from https://www.python.org/downloads/${NC}"
+        exit 1
+    fi
+
+    PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    echo -e "${GREEN}ok${NC} Python ${PYTHON_VER}"
+
+    echo -e "${DIM}Installing contact-exporter via pip...${NC}"
+    python3 -m pip install --upgrade pip 2>/dev/null || true
+    python3 -m pip install "git+https://github.com/powerset-co/contact-exporter.git" 2>&1
+
+    if command -v contact-exporter &>/dev/null; then
+        echo -e "${GREEN}ok${NC} contact-exporter ($(contact-exporter --version 2>&1 | tail -1))"
+    else
+        # pip --user installs to ~/Library/Python/X.Y/bin which may not be on PATH
+        PIP_BIN="$HOME/Library/Python/${PYTHON_VER}/bin"
+        if [[ -f "$PIP_BIN/contact-exporter" ]]; then
+            echo -e "${GREEN}ok${NC} contact-exporter"
+            echo -e "${YELLOW}Add this to your shell profile to put it on PATH:${NC}"
+            echo -e "  export PATH=\"${PIP_BIN}:\$PATH\""
+        else
+            echo -e "${RED}contact-exporter install failed${NC}"
+            exit 1
+        fi
+    fi
+
+    echo -e "${DIM}imsg requires Homebrew — iMessage names may be missing on this macOS version${NC}"
 fi
 
 # ---------------------------------------------------------------------------

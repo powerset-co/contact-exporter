@@ -83,20 +83,35 @@ def _waha_get(url: str, retries: int = 3, backoff: float = 2.0, **kwargs) -> req
 # ---------------------------------------------------------------------------
 
 def _check_docker_installed():
-    """Verify Docker is installed and running, starting Docker Desktop if needed."""
+    """Verify Docker is installed and running, starting Colima/Docker Desktop if needed."""
     if not shutil.which("docker"):
         console.print("[red bold]Docker not found[/red bold]")
         console.print()
         console.print("Docker is required for WhatsApp extraction.")
-        console.print("  Install: [cyan]brew install --cask docker[/cyan]")
+        console.print("  Install: [cyan]brew install colima docker[/cyan]")
         raise SystemExit(1)
 
     result = subprocess.run(["docker", "info"], capture_output=True, text=True, timeout=10)
     if result.returncode == 0:
         return
 
+    # Try Colima first (lightweight, no EULA)
+    if shutil.which("colima"):
+        console.print("[dim]Starting Colima...[/dim]")
+        colima_args = ["colima", "start", "--memory", "2"]
+        # Use Rosetta for faster x86 emulation on Apple Silicon
+        arch_result = subprocess.run(["uname", "-m"], capture_output=True, text=True, timeout=5)
+        if arch_result.stdout.strip() == "arm64":
+            colima_args.extend(["--vm-type", "vz", "--vz-rosetta"])
+        subprocess.run(colima_args, timeout=120)
+        check = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
+        if check.returncode == 0:
+            console.print("[dim]Colima is ready[/dim]")
+            return
+
+    # Fallback: try Docker Desktop
     console.print("[dim]Starting Docker Desktop...[/dim]")
-    subprocess.run(["open", "-a", "Docker"], timeout=10)
+    subprocess.run(["open", "-a", "Docker"], capture_output=True, timeout=10)
     deadline = time.time() + 60
     while time.time() < deadline:
         check = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
@@ -105,9 +120,8 @@ def _check_docker_installed():
             return
         time.sleep(2)
 
-    console.print("[red bold]Docker did not start in time[/red bold]")
-    console.print("Open Docker Desktop manually and complete first-time setup.")
-    console.print("[dim]If this is a fresh install, you need to accept the EULA first.[/dim]")
+    console.print("[red bold]Docker runtime not available[/red bold]")
+    console.print("Install Colima: [cyan]brew install colima docker && colima start[/cyan]")
     raise SystemExit(1)
 
 
@@ -139,9 +153,10 @@ def _start_container():
             "-p", f"127.0.0.1:{WAHA_PORT}:3000",
             "-v", f"{_SESSIONS_DIR}:/app/.sessions",
             "-e", "WAHA_DEFAULT_ENGINE=NOWEB",
+            "-e", "WHATSAPP_DEFAULT_ENGINE=NOWEB",
             "-e", "WHATSAPP_RESTART_ALL_SESSIONS=true",
             "-e", f"WAHA_API_KEY={WAHA_API_KEY}",
-            "devlikeapro/waha:latest",
+            "devlikeapro/waha:noweb-2026.3.4",
         ],
         capture_output=True, text=True, timeout=300,
     )
