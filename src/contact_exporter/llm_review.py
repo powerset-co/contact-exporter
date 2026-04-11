@@ -25,14 +25,16 @@ from contact_exporter.models import CSV_HEADERS, Contact
 console = Console()
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "openai/gpt-4.1-mini"
+DEFAULT_MODEL = "anthropic/claude-sonnet-4-6"
 BATCH_SIZE = 40
 
 # Pricing per 1M tokens (USD) — for cost estimates
 _MODEL_PRICING = {
+    "anthropic/claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
+    "anthropic/claude-haiku-4-5": {"input": 0.80, "output": 4.00},
+    "openai/gpt-4.1": {"input": 2.00, "output": 8.00},
     "openai/gpt-4.1-mini": {"input": 0.40, "output": 1.60},
     "openai/gpt-4.1-nano": {"input": 0.10, "output": 0.40},
-    "anthropic/claude-haiku-4-5": {"input": 0.80, "output": 4.00},
 }
 
 _REVIEW_PROMPT = """\

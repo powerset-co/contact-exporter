@@ -558,6 +558,10 @@ def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bo
     total_written = write_contacts(existing, output_path, limit=MAX_CONTACTS_OUTPUT)
 
     console.print(f"\n[green bold]✅ Extracted top {total_written} contacts (of {len(existing)}) to {output_path}[/green bold]")
-    console.print(f"[dim]Review the file before uploading: cat {output_path}[/dim]")
+    console.print()
+    console.print("[bold]Next steps:[/bold]")
+    console.print(f"  [cyan]contact-exporter llm-review[/cyan]  Auto-classify contacts worth enriching")
+    console.print(f"  [cyan]contact-exporter upload[/cyan]      Upload to Powerset")
+    console.print("[dim]  Use --model to change LLM (default: claude-sonnet-4-6)[/dim]")
 
     return total_written

@@ -645,7 +645,11 @@ def extract_whatsapp(output_path: str = "contacts.csv", reset: bool = False) -> 
             f" → {total_written} total in {output_path}[/green bold]"
         )
         console.print("[dim]WAHA container kept running — re-run without QR scan[/dim]")
-        console.print(f"[dim]To stop: docker rm -f {WAHA_CONTAINER_NAME}[/dim]")
+        console.print()
+        console.print("[bold]Next steps:[/bold]")
+        console.print(f"  [cyan]contact-exporter llm-review[/cyan]  Auto-classify contacts worth enriching")
+        console.print(f"  [cyan]contact-exporter upload[/cyan]      Upload to Powerset")
+        console.print("[dim]  Use --model to change LLM (default: claude-sonnet-4-6)[/dim]")
 
         return total_written
 

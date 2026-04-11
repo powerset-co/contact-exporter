@@ -106,7 +106,7 @@ def main():
     llm_parser = subparsers.add_parser("llm-review", help="LLM-powered contact review (ENRICH/SKIP)")
     llm_parser.add_argument("--file", "-f", default="contacts.csv", help="CSV file to review")
     llm_parser.add_argument("--api-key", help="OpenRouter API key (or set OPENROUTER_API_KEY)")
-    llm_parser.add_argument("--model", default="openai/gpt-4.1-mini", help="Model to use")
+    llm_parser.add_argument("--model", default="anthropic/claude-sonnet-4-6", help="Model to use")
     llm_parser.add_argument("--dry-run", action="store_true", help="Estimate cost without calling API")
 
     review_parser = subparsers.add_parser("review", help="Review contacts interactively before upload")
