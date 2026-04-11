@@ -181,6 +181,17 @@ def _call_openrouter(
     output_tokens = usage.get("completion_tokens", 0)
 
     raw_content = data["choices"][0]["message"]["content"].strip()
+
+    # Strip markdown code fences (```json ... ```) that some models add
+    if raw_content.startswith("```"):
+        lines = raw_content.split("\n")
+        # Remove first line (```json) and last line (```)
+        if lines[-1].strip() == "```":
+            lines = lines[1:-1]
+        elif lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        raw_content = "\n".join(lines).strip()
+
     try:
         parsed = json.loads(raw_content)
         if isinstance(parsed, dict):
