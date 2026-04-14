@@ -225,7 +225,22 @@ if [[ "$USE_BREW" == true ]]; then
         fi
     else
         echo -e "${DIM}Installing contact-exporter via Homebrew...${NC}"
-        brew install powerset-co/powerset/contact-exporter
+        if ! brew install powerset-co/powerset/contact-exporter 2>&1; then
+            echo ""
+            echo -e "${YELLOW}Homebrew install failed — falling back to pip...${NC}"
+            echo -e "${DIM}Upgrading Python and retrying via brew...${NC}"
+            brew upgrade python@3.12 2>/dev/null || true
+            if ! brew install powerset-co/powerset/contact-exporter 2>&1; then
+                echo -e "${YELLOW}Homebrew still failing — installing via pip instead${NC}"
+                pip3 install --upgrade "git+https://github.com/powerset-co/contact-exporter.git" 2>&1 || \
+                    python3 -m pip install --upgrade "git+https://github.com/powerset-co/contact-exporter.git" 2>&1
+            fi
+        fi
+    fi
+
+    if ! command -v contact-exporter &>/dev/null; then
+        echo -e "${RED}Installation failed. Try manually: pip3 install git+https://github.com/powerset-co/contact-exporter.git${NC}"
+        exit 1
     fi
     echo -e "${GREEN}ok${NC} contact-exporter"
 
