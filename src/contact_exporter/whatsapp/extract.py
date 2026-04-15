@@ -197,40 +197,46 @@ def _stop_container():
 # ---------------------------------------------------------------------------
 
 def _render_qr_to_terminal(data: str) -> Text:
-    """Render a QR code for terminal display.
+    """Render a QR code for terminal display using inverted half-block glyphs.
 
-    Packs 2 vertical modules into one half-block glyph ("▀"). This preserves
-    module data exactly while halving height, so large WhatsApp payloads
-    don't consume the full terminal vertically.
+    Matches `qrencode -t UTF8`'s framed look. The "frame" you see is the QR
+    quiet zone rendered as solid `█` glyphs. Each character encodes 2 vertical
+    modules with INVERTED polarity (light = filled glyph, dark = empty space):
+
+        █  = both modules light  (quiet zone, white modules)
+        ▀  = top light, bottom dark
+        ▄  = top dark, bottom light
+        ` ` = both modules dark   (data modules)
+
+    Forced white-on-black so it works on both light and dark terminal themes.
+    QR scanners detect both polarities, so inverted QRs scan fine.
+    1/4 the size of full-block rendering.
     """
     qr = qrcode_lib.QRCode(
-        border=1,
+        border=2,
         error_correction=qrcode_lib.constants.ERROR_CORRECT_L,
     )
     qr.add_data(data)
     qr.make(fit=True)
 
-    # Dense terminal renderer: each glyph encodes 2 vertical modules.
-    # This keeps the render bounded while preserving every module exactly.
     matrix = qr.get_matrix()
-    modules_wide = len(matrix[0])
-    modules_tall = len(matrix)
-
-    term_width = console.width or 80
-    max_render_width = max(1, min(term_width - 2, 70))  # fixed cap
-    glyph_repeat = max(1, max_render_width // modules_wide)
+    rows = len(matrix)
+    cols = len(matrix[0])
 
     output = Text()
-    for y in range(0, modules_tall, 2):
-        top = matrix[y]
-        bottom = matrix[y + 1] if y + 1 < modules_tall else [False] * modules_wide
-
-        for x in range(modules_wide):
-            fg = "black" if top[x] else "white"
-            bg = "black" if bottom[x] else "white"
-            output.append("▀" * glyph_repeat, style=f"{fg} on {bg}")
-
-        if y + 2 < modules_tall:
+    for y in range(0, rows, 2):
+        for x in range(cols):
+            top_dark = matrix[y][x]
+            bottom_dark = matrix[y + 1][x] if y + 1 < rows else False
+            if not top_dark and not bottom_dark:
+                output.append("█", style="white on black")
+            elif not top_dark:
+                output.append("▀", style="white on black")
+            elif not bottom_dark:
+                output.append("▄", style="white on black")
+            else:
+                output.append(" ", style="white on black")
+        if y + 2 < rows:
             output.append("\n")
     return output
 
