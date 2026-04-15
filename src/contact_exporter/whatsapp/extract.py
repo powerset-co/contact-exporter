@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,7 @@ _WAHA_BASE = f"http://127.0.0.1:{WAHA_PORT}"
 
 # Persistent session storage — survives container restarts
 _SESSIONS_DIR = Path.home() / ".powerset" / "waha-sessions"
+_QR_SVG_PATH = _SESSIONS_DIR / "latest-qr.svg"
 
 # E.164 phone numbers: 7-15 digits
 _MIN_PHONE_DIGITS = 7
@@ -195,29 +197,92 @@ def _stop_container():
 # ---------------------------------------------------------------------------
 
 def _render_qr_to_terminal(data: str) -> Text:
-    """Render a QR code using Rich styled backgrounds.
+    """Render a QR code for terminal display.
 
-    Uses explicit black/white background colors on spaces — no half-block
-    Unicode chars that break with terminal line spacing.
-    Returns a Text object for use with Rich Live display.
+    Packs 2 vertical modules into one half-block glyph ("▀"). This preserves
+    module data exactly while halving height, so large WhatsApp payloads
+    don't consume the full terminal vertically.
     """
+    qr = qrcode_lib.QRCode(
+        border=1,
+        error_correction=qrcode_lib.constants.ERROR_CORRECT_L,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+
+    # Dense terminal renderer: each glyph encodes 2 vertical modules.
+    # This keeps the render bounded while preserving every module exactly.
+    matrix = qr.get_matrix()
+    modules_wide = len(matrix[0])
+    modules_tall = len(matrix)
+
+    term_width = console.width or 80
+    max_render_width = max(1, min(term_width - 2, 70))  # fixed cap
+    glyph_repeat = max(1, max_render_width // modules_wide)
+
+    output = Text()
+    for y in range(0, modules_tall, 2):
+        top = matrix[y]
+        bottom = matrix[y + 1] if y + 1 < modules_tall else [False] * modules_wide
+
+        for x in range(modules_wide):
+            fg = "black" if top[x] else "white"
+            bg = "black" if bottom[x] else "white"
+            output.append("▀" * glyph_repeat, style=f"{fg} on {bg}")
+
+        if y + 2 < modules_tall:
+            output.append("\n")
+    return output
+
+
+def _write_qr_svg(data: str, output_path: Path = _QR_SVG_PATH) -> Path:
+    """Write a crisp SVG QR image for reliable scanning outside terminal text rendering."""
     qr = qrcode_lib.QRCode(
         border=2,
         error_correction=qrcode_lib.constants.ERROR_CORRECT_L,
     )
     qr.add_data(data)
     qr.make(fit=True)
-
-    output = Text()
     matrix = qr.get_matrix()
-    for i, row in enumerate(matrix):
-        for cell in row:
-            # 2 spaces per module — terminal chars are ~2:1 height:width,
-            # so 2 spaces makes each module roughly square (scannable)
-            output.append("  ", style="on black" if cell else "on white")
-        if i < len(matrix) - 1:
-            output.append("\n")
-    return output
+
+    module_px = 10
+    size = len(matrix)
+    canvas = size * module_px
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {canvas} {canvas}" '
+        f'width="{canvas}" height="{canvas}" shape-rendering="crispEdges">',
+        f'<rect width="{canvas}" height="{canvas}" fill="white"/>',
+    ]
+
+    for y, row in enumerate(matrix):
+        for x, module in enumerate(row):
+            if module:
+                svg.append(
+                    f'<rect x="{x * module_px}" y="{y * module_px}" '
+                    f'width="{module_px}" height="{module_px}" fill="black"/>'
+                )
+
+    svg.append("</svg>")
+    output_path.write_text("\n".join(svg), encoding="utf-8")
+    return output_path
+
+
+def _open_qr_svg(path: Path) -> bool:
+    """Best-effort open QR image in a native viewer/browser."""
+    if sys.platform == "darwin":
+        cmd = ["open", str(path)]
+    elif shutil.which("xdg-open"):
+        cmd = ["xdg-open", str(path)]
+    else:
+        return False
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -310,11 +375,25 @@ def _create_session():
         raise SystemExit(1)
 
 
-def _build_qr_display(qr_text: Text | None, status: str, remaining: int) -> Text:
+def _build_qr_display(
+    qr_text: Text | None,
+    status: str,
+    remaining: int,
+    qr_svg_path: Path | None = None,
+) -> Text:
     """Build the full QR display panel for Rich Live."""
     output = Text()
     output.append("Scan the QR code with WhatsApp on your phone\n", style="bold")
     output.append("WhatsApp > Settings > Linked Devices > Link a Device\n\n", style="dim")
+    if qr_svg_path:
+        output.append(
+            f"Backup QR image: {qr_svg_path}\n",
+            style="dim",
+        )
+        output.append(
+            "If terminal rendering looks broken, scan this image file instead.\n\n",
+            style="dim",
+        )
 
     if qr_text:
         output.append_text(qr_text)
@@ -335,9 +414,11 @@ def _wait_for_qr_auth(timeout: int = 120):
     last_qr_value = None
     last_qr_time = 0.0
     qr_text: Text | None = None
+    qr_svg_path: Path | None = None
+    tried_open_svg = False
 
     with Live(
-        _build_qr_display(None, "starting", timeout),
+        _build_qr_display(None, "starting", timeout, qr_svg_path),
         console=console,
         refresh_per_second=1,
     ) as live:
@@ -349,7 +430,7 @@ def _wait_for_qr_auth(timeout: int = 120):
                     headers=_WAHA_HEADERS, timeout=30,
                 )
                 if resp.status_code != 200:
-                    live.update(_build_qr_display(qr_text, f"HTTP {resp.status_code}", remaining))
+                    live.update(_build_qr_display(qr_text, f"HTTP {resp.status_code}", remaining, qr_svg_path))
                     time.sleep(2)
                     continue
 
@@ -378,13 +459,17 @@ def _wait_for_qr_auth(timeout: int = 120):
                         qr_value = qr_data.get("value") or qr_data.get("qr", "")
                         if qr_value and qr_value != last_qr_value:
                             qr_text = _render_qr_to_terminal(qr_value)
+                            qr_svg_path = _write_qr_svg(qr_value)
+                            if not tried_open_svg:
+                                _open_qr_svg(qr_svg_path)
+                                tried_open_svg = True
                             last_qr_value = qr_value
                             last_qr_time = time.time()
 
-                live.update(_build_qr_display(qr_text, status, remaining))
+                live.update(_build_qr_display(qr_text, status, remaining, qr_svg_path))
 
             except requests.RequestException as e:
-                live.update(_build_qr_display(qr_text, f"waiting ({type(e).__name__})", remaining))
+                live.update(_build_qr_display(qr_text, f"waiting ({type(e).__name__})", remaining, qr_svg_path))
 
             time.sleep(3)
 

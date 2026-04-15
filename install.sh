@@ -206,6 +206,9 @@ echo ""
 if [[ "$USE_BREW" == true ]]; then
     # --- Homebrew install path ---
 
+    # Ensure pip is 26.0+ (required for Homebrew's --uploaded-prior-to flag)
+    python3 -m pip install --upgrade pip 2>/dev/null || true
+
     # Ensure the tap is fresh
     brew tap powerset-co/powerset 2>/dev/null || true
     brew update --quiet 2>/dev/null || true
