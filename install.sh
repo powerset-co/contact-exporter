@@ -232,7 +232,7 @@ if [[ "$USE_BREW" == true ]]; then
             echo ""
             echo -e "${YELLOW}Homebrew install failed — falling back to pip...${NC}"
             echo -e "${DIM}Upgrading Python and retrying via brew...${NC}"
-            brew upgrade python@3.12 2>/dev/null || true
+            brew upgrade python@3.13 2>/dev/null || brew upgrade python@3.12 2>/dev/null || true
             if ! brew install powerset-co/powerset/contact-exporter 2>&1; then
                 echo -e "${YELLOW}Homebrew still failing — installing via pip instead${NC}"
                 pip3 install --upgrade "git+https://github.com/powerset-co/contact-exporter.git" 2>&1 || \

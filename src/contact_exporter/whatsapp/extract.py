@@ -16,6 +16,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import qrcode as qrcode_lib
 import requests
@@ -25,13 +26,12 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.text import Text
 
 from contact_exporter.config import (
-    MAX_CONTACTS_OUTPUT,
-    MESSAGE_COUNT_CAP,
     WAHA_API_KEY,
     WAHA_CONTAINER_NAME,
     WAHA_PORT,
     WAHA_SESSION_NAME,
 )
+from contact_exporter.matching import apply_local_name_matching, sync_candidate_catalog
 from contact_exporter.merge import load_existing_contacts, merge_contact, write_contacts
 from contact_exporter.models import Contact
 
@@ -50,6 +50,8 @@ _QR_SVG_PATH = _SESSIONS_DIR / "latest-qr.svg"
 # E.164 phone numbers: 7-15 digits
 _MIN_PHONE_DIGITS = 7
 _MAX_PHONE_DIGITS = 15
+_MESSAGE_PAGE_SIZE = 500
+_MESSAGE_COUNT_WORKERS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +492,14 @@ def _wait_for_qr_auth(timeout: int = 120):
 def _extract_jid(raw_id) -> str:
     """Extract serialized JID string from a WAHA id (may be string or dict)."""
     if isinstance(raw_id, dict):
-        return raw_id.get("_serialized", "") or raw_id.get("user", "")
+        serialized = raw_id.get("_serialized", "")
+        if serialized:
+            return serialized
+        user = raw_id.get("user", "")
+        server = raw_id.get("server", "")
+        if user and server:
+            return f"{user}@{server}"
+        return str(user)
     return str(raw_id)
 
 
@@ -516,27 +525,52 @@ def _jid_to_phone(jid: str) -> str | None:
 # Data extraction
 # ---------------------------------------------------------------------------
 
+def _chat_message_count_hint(chat: dict) -> int | None:
+    """Best-effort message count from chat metadata if WAHA exposes it."""
+    for key in ("messagesCount", "messages_count", "messageCount", "totalMessages", "total_messages"):
+        value = chat.get(key)
+        if isinstance(value, int) and value >= 0:
+            return value
+    return None
+
+
 def _get_chat_message_count(chat_id: str) -> int:
-    """Count messages in a 1:1 chat, capped at MESSAGE_COUNT_CAP."""
+    """Count all messages in a 1:1 chat via paginated WAHA API reads."""
+    total = 0
+    offset = 0
+    max_pages = 10_000  # hard safety guard
+    pages = 0
+
     try:
-        resp = _waha_get(
-            f"{_WAHA_BASE}/api/{WAHA_SESSION_NAME}/chats/{chat_id}/messages",
-            params={"limit": MESSAGE_COUNT_CAP + 1, "downloadMedia": "false"},
-        )
-        if resp.status_code == 200:
+        while pages < max_pages:
+            resp = _waha_get(
+                f"{_WAHA_BASE}/api/{WAHA_SESSION_NAME}/chats/{chat_id}/messages",
+                params={
+                    "limit": _MESSAGE_PAGE_SIZE,
+                    "offset": offset,
+                    "downloadMedia": "false",
+                },
+            )
+            if resp.status_code != 200:
+                console.print(f"[dim red]  ✗ {chat_id}: HTTP {resp.status_code}[/dim red]")
+                break
+
             messages = resp.json()
-            if isinstance(messages, list):
-                count = min(len(messages), MESSAGE_COUNT_CAP)
-                if count == 0:
-                    console.print(f"[dim yellow]  ⚠ {chat_id}: API returned 0 messages[/dim yellow]")
-                return count
-            else:
-                console.print(f"[dim red]  ✗ {chat_id}: unexpected response type: {type(messages).__name__}[/dim red]")
-        else:
-            console.print(f"[dim red]  ✗ {chat_id}: HTTP {resp.status_code}[/dim red]")
+            if not isinstance(messages, list):
+                console.print(
+                    f"[dim red]  ✗ {chat_id}: unexpected response type: {type(messages).__name__}[/dim red]"
+                )
+                break
+
+            n = len(messages)
+            total += n
+            pages += 1
+            if n < _MESSAGE_PAGE_SIZE:
+                break
+            offset += n
     except requests.RequestException as e:
         console.print(f"[dim red]  ✗ {chat_id}: request error: {e}[/dim red]")
-    return 0
+    return total
 
 
 def _parse_timestamp(ts) -> str | None:
@@ -573,13 +607,14 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
 
     # Build lookups from contacts in a single pass:
     # - jid_to_name: any JID -> display name
-    # - phone_to_name: phone -> display name (for group-only contacts)
+    # - phone_to_name: phone -> best display name from WhatsApp contacts
     # - lid_to_phones: @lid JID -> list of E.164 phones (matched via contact name)
     #   Usually 1 phone, but ambiguous names (e.g. "Chrissy Hu" with 2 numbers)
     #   produce multiple entries — we create a Contact for each.
     jid_to_name: dict[str, str] = {}
     phone_to_name: dict[str, str] = {}
     lid_to_phones: dict[str, list[str]] = {}
+    all_contact_phones: set[str] = set()
 
     # Pass 1: index @c.us contacts by name, build jid_to_name for all
     name_to_phones: dict[str, list[str]] = {}
@@ -589,10 +624,13 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
         name = raw.get("name") or raw.get("pushname") or raw.get("shortName") or ""
         if raw_jid and name:
             jid_to_name[raw_jid] = name
-        phone = _jid_to_phone(raw_jid)
+        phone = _jid_to_phone(_extract_jid(raw.get("phoneNumber", ""))) or _jid_to_phone(raw_jid)
         if phone:
+            all_contact_phones.add(phone)
             if name:
-                phone_to_name[phone] = name
+                existing_name = phone_to_name.get(phone, "")
+                if not existing_name or len(name) > len(existing_name):
+                    phone_to_name[phone] = name
                 name_to_phones.setdefault(name, []).append(phone)
         elif "@lid" in raw_jid and name:
             lid_jids_by_name.setdefault(name, []).append(raw_jid)
@@ -609,30 +647,63 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
 
     direct_chats: dict[str, dict] = {}
     group_member_phones: set[str] = set()
+    group_member_phone_to_name: dict[str, str] = {}
 
     for chat in chats:
         chat_id = _extract_jid(chat.get("id", ""))
         if "@g.us" in chat_id:
             participants = chat.get("participants") or chat.get("groupMetadata", {}).get("participants", [])
+            if not participants:
+                # Newer WAHA responses may omit participants from /chats payload.
+                group_resp = _waha_get(f"{_WAHA_BASE}/api/{session}/groups/{chat_id}/participants")
+                participants = group_resp.json() if group_resp.status_code == 200 else []
             for p in participants:
                 p_jid = _extract_jid(p.get("id", ""))
-                phone = _jid_to_phone(p_jid)
+                phone = _jid_to_phone(_extract_jid(p.get("phoneNumber", ""))) or _jid_to_phone(p_jid)
                 if phone:
                     group_member_phones.add(phone)
+                    group_name = jid_to_name.get(p_jid, "")
+                    if group_name and phone not in group_member_phone_to_name:
+                        group_member_phone_to_name[phone] = group_name
                 else:
                     for ph in lid_to_phones.get(p_jid, []):
                         group_member_phones.add(ph)
+                        group_name = jid_to_name.get(p_jid, "")
+                        if group_name and ph not in group_member_phone_to_name:
+                            group_member_phone_to_name[ph] = group_name
         else:
             direct_chats[chat_id] = chat
 
     console.print(f"[dim]Found {len(raw_contacts)} contacts, {len(direct_chats)} direct chats[/dim]\n")
 
-    contacts_by_phone: dict[str, Contact] = {}
+    # Base set: all WhatsApp contacts with phone numbers.
+    contacts_by_phone: dict[str, Contact] = {
+        phone: Contact(
+            phone=phone,
+            name=phone_to_name.get(phone, ""),
+            source="whatsapp",
+            is_in_group_chats=phone in group_member_phones,
+        )
+        for phone in all_contact_phones
+    }
+
     direct_jids = [
         jid for jid in direct_chats
         if _jid_to_phone(jid) or lid_to_phones.get(jid)
     ]
 
+    # Phase 1: resolve known message counts from chat payload hints.
+    counts_by_jid: dict[str, int] = {}
+    needs_fetch: list[str] = []
+    for jid in direct_jids:
+        chat = direct_chats.get(jid, {})
+        hinted = _chat_message_count_hint(chat)
+        if hinted is not None:
+            counts_by_jid[jid] = hinted
+        else:
+            needs_fetch.append(jid)
+
+    # Phase 2: fetch full history counts for chats without hints (parallel).
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -640,43 +711,102 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
         TextColumn("{task.completed}/{task.total}"),
         console=console,
     ) as progress:
-        task = progress.add_task("Counting messages", total=len(direct_jids))
+        task = progress.add_task("Counting full chat history", total=len(direct_jids))
 
-        for jid in direct_jids:
+        # Advance for pre-resolved chats first.
+        for _ in range(len(direct_jids) - len(needs_fetch)):
             progress.advance(task)
 
-            # Resolve JID to phone(s): @c.us → 1 phone, @lid → possibly multiple
-            direct_phone = _jid_to_phone(jid)
-            phones = [direct_phone] if direct_phone else lid_to_phones.get(jid, [])
-            if not phones:
+        if needs_fetch:
+            with ThreadPoolExecutor(max_workers=_MESSAGE_COUNT_WORKERS) as pool:
+                future_map = {pool.submit(_get_chat_message_count, jid): jid for jid in needs_fetch}
+                for fut in as_completed(future_map):
+                    jid = future_map[fut]
+                    try:
+                        counts_by_jid[jid] = fut.result()
+                    except Exception:
+                        counts_by_jid[jid] = 0
+                    progress.advance(task)
+
+    # Collapse chat stats by phone to avoid duplicate rows for obvious same contacts.
+    direct_stats_by_phone: dict[str, dict] = {}
+    for jid in direct_jids:
+        # Resolve JID to phone(s): @c.us → 1 phone, @lid → possibly multiple
+        direct_phone = _jid_to_phone(jid)
+        phones = [direct_phone] if direct_phone else lid_to_phones.get(jid, [])
+        if not phones:
+            continue
+
+        count = int(counts_by_jid.get(jid, 0))
+
+        chat = direct_chats[jid]
+        last_message = _parse_timestamp(
+            chat.get("timestamp") or chat.get("last_message_timestamp")
+        )
+
+        for phone in phones:
+            # WAHA chats often use "...@s.whatsapp.net" while contacts use
+            # "...@c.us"; fall back to phone-based name lookup.
+            resolved_name = (
+                jid_to_name.get(jid, "")
+                or phone_to_name.get(phone, "")
+                or group_member_phone_to_name.get(phone, "")
+            )
+            current = direct_stats_by_phone.get(phone)
+            if not current:
+                direct_stats_by_phone[phone] = {
+                    "count": count,
+                    "last_message": last_message,
+                    "name": resolved_name,
+                }
                 continue
 
-            count = _get_chat_message_count(jid)
+            current["count"] = int(current.get("count", 0) or 0) + count
+            if last_message and (
+                not current.get("last_message")
+                or last_message > current["last_message"]
+            ):
+                current["last_message"] = last_message
+            if resolved_name:
+                existing_name = current.get("name", "") or ""
+                if not existing_name or len(resolved_name) > len(existing_name):
+                    current["name"] = resolved_name
 
-            chat = direct_chats[jid]
-            last_message = _parse_timestamp(
-                chat.get("timestamp") or chat.get("last_message_timestamp")
+    # Overlay direct-chat metadata onto the union baseline.
+    for phone, stats in direct_stats_by_phone.items():
+        existing = contacts_by_phone.get(phone)
+        if existing:
+            if (not existing.name) and stats.get("name"):
+                existing.name = stats["name"]
+            existing.is_in_group_chats = existing.is_in_group_chats or (phone in group_member_phones)
+            existing.message_count = int(stats.get("count", 0) or 0) or None
+            existing.last_message = stats.get("last_message")
+        else:
+            contacts_by_phone[phone] = Contact(
+                phone=phone,
+                name=stats.get("name", "") or "",
+                source="whatsapp",
+                is_in_group_chats=phone in group_member_phones,
+                message_count=int(stats.get("count", 0) or 0) or None,
+                last_message=stats.get("last_message"),
             )
 
-            for phone in phones:
-                contacts_by_phone[phone] = Contact(
-                    phone=phone,
-                    name=jid_to_name.get(jid, ""),
-                    source="whatsapp",
-                    is_in_group_chats=phone in group_member_phones,
-                    message_count=count,
-                    last_message=last_message,
-                )
-
-    # Add group-only contacts (seen in groups but no direct chat)
+    # Add group-only contacts (seen in groups but no direct chat/contact row).
     for phone in group_member_phones:
+        group_name = phone_to_name.get(phone, "") or group_member_phone_to_name.get(phone, "")
         if phone not in contacts_by_phone:
             contacts_by_phone[phone] = Contact(
                 phone=phone,
-                name=phone_to_name.get(phone, ""),
+                name=group_name,
                 source="whatsapp",
                 is_in_group_chats=True,
             )
+            continue
+
+        # Enrich existing union rows with group signal/name when missing.
+        contacts_by_phone[phone].is_in_group_chats = True
+        if not contacts_by_phone[phone].name and group_name:
+            contacts_by_phone[phone].name = group_name
 
     return contacts_by_phone
 
@@ -729,16 +859,23 @@ def extract_whatsapp(output_path: str = "contacts.csv", reset: bool = False) -> 
             else:
                 existing[phone] = new_contact
 
-        total_written = write_contacts(existing, output_path, limit=MAX_CONTACTS_OUTPUT)
+        candidates = sync_candidate_catalog()
+        match_stats = apply_local_name_matching(existing, candidates)
+
+        total_written = write_contacts(existing, output_path)
 
         console.print(
             f"\n[green bold]✅ {len(wa_contacts)} WhatsApp contacts merged"
             f" → {total_written} total in {output_path}[/green bold]"
         )
+        console.print(
+            f"[dim]Local match results: matched={match_stats['matched']} "
+            f"suggested={match_stats['suggested']} unmatched={match_stats['unmatched']}[/dim]"
+        )
         console.print("[dim]WAHA container kept running — re-run without QR scan[/dim]")
         console.print()
         console.print("[bold]Next steps:[/bold]")
-        console.print(f"  [cyan]contact-exporter llm-review[/cyan]  Auto-classify contacts worth enriching")
+        console.print(f"  [cyan]contact-exporter llm-review[/cyan]  Analyze unmatched contacts")
         console.print(f"  [cyan]contact-exporter upload[/cyan]      Upload to Powerset")
         console.print("[dim]  Use --model to change LLM (default: claude-sonnet-4-6)[/dim]")
 

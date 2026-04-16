@@ -27,6 +27,7 @@ console = Console()
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "anthropic/claude-sonnet-4-6"
 BATCH_SIZE = 40
+_DEFAULT_REVIEW_MATCH_STATUSES = {"unmatched", "suggested"}
 
 # Pricing per 1M tokens (USD) — for cost estimates
 _MODEL_PRICING = {
@@ -52,8 +53,7 @@ finance, or any professional domain — say so in the reason and ENRICH. Even \
 partial recognition counts — if the name *could* belong to someone notable, \
 ENRICH and explain the possible association. The user's phone contacts are \
 already filtered to people they actually know.
-- **Message volume**: Higher message counts suggest a real relationship \
-(max is 200 = very active)
+- **Message volume**: Higher message counts suggest a real relationship
 - **Recency**: Recently contacted people are more valuable, but a recognizable \
 full name can override low recency
 - **Skip patterns**: Skip entries that are:
@@ -82,8 +82,11 @@ in the same order:
 Return ONLY the JSON object, no other text."""
 
 
-def _load_contacts_for_review(csv_path: str) -> list[dict]:
-    """Load contacts from CSV, returning only those with names."""
+def _load_contacts_for_review(csv_path: str, include_matched: bool = False) -> list[dict]:
+    """Load contacts from CSV, returning named contacts for review.
+
+    By default, only include contacts that are unmatched/suggested.
+    """
     contacts = []
     path = Path(csv_path)
     if not path.exists():
@@ -96,6 +99,11 @@ def _load_contacts_for_review(csv_path: str) -> list[dict]:
             name = (row.get("name") or "").strip()
             if not name:
                 continue
+            match_status = (row.get("match_status") or "").strip().lower()
+            # Treat empty status as unmatched for legacy rows.
+            effective_status = match_status or "unmatched"
+            if not include_matched and effective_status not in _DEFAULT_REVIEW_MATCH_STATUSES:
+                continue
             contacts.append({
                 "phone": row.get("phone", ""),
                 "name": name,
@@ -104,6 +112,7 @@ def _load_contacts_for_review(csv_path: str) -> list[dict]:
                 "message_count": int(row["message_count"]) if row.get("message_count") else 0,
                 "last_message": row.get("last_message", ""),
                 "skip": row.get("skip", ""),
+                "match_status": effective_status,
             })
     return contacts
 
@@ -259,6 +268,7 @@ def review_contacts_llm(
     api_key: str | None = None,
     model: str = DEFAULT_MODEL,
     dry_run: bool = False,
+    include_matched: bool = False,
 ) -> None:
     """Run LLM review on contacts CSV.
 
@@ -275,9 +285,12 @@ def review_contacts_llm(
         console.print("  [cyan]export OPENROUTER_API_KEY=sk-or-...[/cyan]")
         raise SystemExit(1)
 
-    contacts = _load_contacts_for_review(csv_path)
+    contacts = _load_contacts_for_review(csv_path, include_matched=include_matched)
     if not contacts:
-        console.print("[yellow]No named contacts found in CSV.[/yellow]")
+        if include_matched:
+            console.print("[yellow]No named contacts found in CSV.[/yellow]")
+        else:
+            console.print("[yellow]No unmatched/suggested named contacts found in CSV.[/yellow]")
         return
 
     total_batches = (len(contacts) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -285,7 +298,10 @@ def review_contacts_llm(
 
     console.print(f"[bold]LLM Contact Review[/bold]")
     console.print(f"[dim]Model: {model}[/dim]")
-    console.print(f"[dim]Contacts with names: {len(contacts)}[/dim]")
+    if include_matched:
+        console.print(f"[dim]Contacts with names: {len(contacts)}[/dim]")
+    else:
+        console.print(f"[dim]Unmatched/suggested contacts with names: {len(contacts)}[/dim]")
     console.print(f"[dim]Batches: {total_batches}[/dim]")
     console.print(f"[dim]Estimated cost: ${est_cost:.4f}[/dim]")
     console.print()

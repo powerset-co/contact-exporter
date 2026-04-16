@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 
 from contact_exporter.auth.credentials import get_auth_header
-from contact_exporter.config import API_BASE_URL, UPLOAD_CHUNK_SIZE
+from contact_exporter.config import UPLOAD_CHUNK_SIZE, get_api_base_url
 from contact_exporter.models import Contact
 
 console = Console()
@@ -26,6 +26,7 @@ def upload_contacts(file_path: str = "contacts.csv") -> None:
 
     headers = get_auth_header()
     headers["Content-Type"] = "application/json"
+    api_base_url = get_api_base_url()
 
     # Read CSV, skip contacts marked for exclusion
     contacts = []
@@ -84,7 +85,7 @@ def upload_contacts(file_path: str = "contacts.csv") -> None:
             for chunk in chunks:
                 try:
                     resp = requests.post(
-                        f"{API_BASE_URL}/v2/contacts/import",
+                        f"{api_base_url}/v2/contacts/import",
                         headers=headers,
                         json={"contacts": chunk, "source_channel": source},
                         timeout=60,

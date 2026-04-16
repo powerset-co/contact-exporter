@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from contact_exporter.config import MAX_CONTACTS_OUTPUT
 from contact_exporter.models import CSV_HEADERS, Contact
 
 
@@ -53,6 +52,19 @@ def merge_contact(existing: Contact, new: Contact) -> Contact:
     combined = sorted(existing_sources | new_sources)
     source = ",".join(combined) or new.source
 
+    # Preserve richer local match metadata if available.
+    match_status = existing.match_status or new.match_status
+    matched_person_id = existing.matched_person_id or new.matched_person_id
+    matched_name = existing.matched_name or new.matched_name
+    matched_linkedin_url = existing.matched_linkedin_url or new.matched_linkedin_url
+    match_confidence = existing.match_confidence
+    if new.match_confidence is not None and (
+        match_confidence is None or new.match_confidence > match_confidence
+    ):
+        match_confidence = new.match_confidence
+    match_method = existing.match_method or new.match_method
+    match_reason = existing.match_reason or new.match_reason
+
     return Contact(
         phone=existing.phone,
         name=existing.name or new.name,
@@ -61,20 +73,29 @@ def merge_contact(existing: Contact, new: Contact) -> Contact:
         message_count=message_count,
         last_message=last_message,
         skip=existing.skip,  # Preserve skip from previous run
+        match_status=match_status,
+        matched_person_id=matched_person_id,
+        matched_name=matched_name,
+        matched_linkedin_url=matched_linkedin_url,
+        match_confidence=match_confidence,
+        match_method=match_method,
+        match_reason=match_reason,
     )
 
 
 def write_contacts(
     contacts: dict[str, Contact],
     path: str,
-    limit: int = MAX_CONTACTS_OUTPUT,
+    limit: int | None = None,
 ) -> int:
-    """Write contacts to CSV, sorted by message count desc, capped at limit."""
+    """Write contacts to CSV, sorted by message count desc."""
     sorted_contacts = sorted(
         contacts.values(),
         key=lambda c: (c.message_count or 0),
         reverse=True,
-    )[:limit]
+    )
+    if limit is not None:
+        sorted_contacts = sorted_contacts[:limit]
 
     with Path(path).open("w", newline="") as f:
         writer = csv.writer(f)

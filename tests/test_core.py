@@ -254,7 +254,11 @@ check("has newlines (multiline)", "\n" in plain)
 lines = plain.split("\n")
 check("all lines same length", len(set(len(l) for l in lines)) == 1,
       f"line lengths: {set(len(l) for l in lines)}")
-check("only spaces (styled)", all(c == " " for c in plain.replace("\n", "")))
+allowed_qr_chars = {" ", "█", "▀", "▄"}
+check(
+    "only QR block chars",
+    all(c in allowed_qr_chars for c in plain.replace("\n", "")),
+)
 
 
 # ===================================================================

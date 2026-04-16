@@ -14,13 +14,14 @@ import sqlite3
 import subprocess
 import time
 import webbrowser
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 
-from contact_exporter.config import MAX_CONTACTS_OUTPUT, MESSAGE_COUNT_CAP, SMALL_GROUP_MAX_MEMBERS
+from contact_exporter.matching import apply_local_name_matching, sync_candidate_catalog
 from contact_exporter.merge import load_existing_contacts, merge_contact, write_contacts
 from contact_exporter.models import Contact
 
@@ -175,27 +176,61 @@ def _add_phone_to_lookup(lookup: dict[str, str], phone_raw: str, name: str) -> N
         lookup[digits] = name
 
 
-def _query_contacts_sqlite() -> dict[str, str]:
-    """Read phone→name mappings directly from AddressBook SQLite databases."""
+def _canonical_contact_phone(phone_raw: str) -> str:
+    """Canonicalize contact phone for CSV rows.
+
+    Prefer E.164-like output for US/CA numbers so iMessage and WhatsApp rows
+    converge more often on the same key.
+    """
+    raw = (phone_raw or "").strip()
+    digits = re.sub(r"[^\d]", "", raw)
+    if len(digits) < 7:
+        return ""
+    if raw.startswith("+"):
+        return f"+{digits}"
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return digits
+
+
+def _add_contact_entry(contacts: dict[str, str], phone_raw: str, name: str) -> None:
+    """Add canonical phone->name entry to contact inventory."""
+    canonical = _canonical_contact_phone(phone_raw)
+    if not canonical:
+        return
+    name = (name or "").strip()
+    existing = contacts.get(canonical, "")
+    if name and (not existing or len(name) > len(existing)):
+        contacts[canonical] = name
+    elif canonical not in contacts:
+        contacts[canonical] = name
+
+
+def _query_contacts_sqlite() -> tuple[dict[str, str], dict[str, str]]:
+    """Read contacts and phone→name lookup from AddressBook SQLite databases."""
     db_paths = glob.glob(_ADDRESSBOOK_GLOB)
     if not db_paths:
-        return {}
+        return {}, {}
 
+    contacts: dict[str, str] = {}
     lookup: dict[str, str] = {}
     for db_path in db_paths:
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             for phone_raw, first, last in conn.execute(_CONTACTS_QUERY):
                 name = _clean_contact_name(first or "", last or "")
+                _add_contact_entry(contacts, phone_raw, name)
                 _add_phone_to_lookup(lookup, phone_raw, name)
             conn.close()
         except sqlite3.Error:
             continue
 
-    return lookup
+    return contacts, lookup
 
 
-def _query_contacts_applescript() -> dict[str, str]:
+def _query_contacts_applescript() -> tuple[dict[str, str], dict[str, str]]:
     """Fallback: query Contacts.app via AppleScript (slow but reliable)."""
     try:
         subprocess.run(
@@ -209,37 +244,45 @@ def _query_contacts_applescript() -> dict[str, str]:
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0:
-            return {}
+            return {}, {}
     except subprocess.TimeoutExpired:
-        return {}
+        return {}, {}
 
+    contacts: dict[str, str] = {}
     lookup: dict[str, str] = {}
     for line in result.stdout.strip().split("\n"):
         if "\t" not in line:
             continue
         phone_raw, name = line.split("\t", 1)
+        _add_contact_entry(contacts, phone_raw, name)
         _add_phone_to_lookup(lookup, phone_raw, name)
 
-    return lookup
+    return contacts, lookup
 
 
-def _build_contact_name_lookup() -> dict[str, str]:
-    """Build phone→name mapping from macOS Contacts.
+def _build_contacts_index() -> tuple[dict[str, str], dict[str, str]]:
+    """Build contact inventory + lookup map from macOS Contacts.
 
     Tries direct SQLite read first (fast), falls back to AppleScript.
     """
-    lookup = _query_contacts_sqlite()
-    if lookup:
-        console.print(f"[dim]Loaded {len(lookup)} contacts from AddressBook database[/dim]")
-        return lookup
+    contacts, lookup = _query_contacts_sqlite()
+    if contacts:
+        console.print(f"[dim]Loaded {len(contacts)} contacts from AddressBook database[/dim]")
+        return contacts, lookup
 
     console.print("[dim]SQLite read failed, falling back to AppleScript...[/dim]")
-    lookup = _query_contacts_applescript()
-    if lookup:
-        return lookup
+    contacts, lookup = _query_contacts_applescript()
+    if contacts:
+        return contacts, lookup
 
-    console.print("[yellow]Warning: could not load contacts — names will be missing from export[/yellow]")
+    console.print("[yellow]Warning: could not load local Contacts.app data[/yellow]")
     console.print("[dim]Ensure Full Disk Access is granted to your terminal app[/dim]")
+    return contacts, lookup
+
+
+def _build_contact_name_lookup() -> dict[str, str]:
+    """Backward-compatible helper used by tests and legacy call sites."""
+    _, lookup = _build_contacts_index()
     return lookup
 
 
@@ -285,106 +328,59 @@ def _open_chat_db() -> sqlite3.Connection:
     return conn
 
 
-def _list_conversations(conn: sqlite3.Connection) -> list[dict]:
-    """List all conversations with last message timestamp."""
-    rows = conn.execute("""
-        SELECT c.ROWID AS id,
-               c.chat_identifier AS identifier,
-               c.display_name AS display_name,
-               MAX(m.date) AS last_date
-        FROM chat c
-        JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
-        JOIN message m ON m.ROWID = cmj.message_id
-        GROUP BY c.ROWID
-        ORDER BY last_date DESC
-    """).fetchall()
+def _aggregate_handle_message_stats() -> dict[str, dict]:
+    """Aggregate full-history message counts and recency by handle in one query."""
+    conn = _open_chat_db()
+    try:
+        rows = conn.execute("""
+            SELECT
+                h.id AS identifier,
+                COUNT(*) AS msg_count,
+                MAX(m.date) AS last_date_ns
+            FROM message m
+            JOIN handle h ON h.ROWID = m.handle_id
+            WHERE h.id IS NOT NULL
+              AND h.id <> ''
+              AND (m.associated_message_type IS NULL
+                   OR m.associated_message_type < 2000
+                   OR m.associated_message_type > 3006)
+            GROUP BY h.id
+        """).fetchall()
+    finally:
+        conn.close()
 
-    return [
-        {
-            "id": row["id"],
-            "identifier": row["identifier"] or "",
-            "display_name": row["display_name"] or "",
-            "last_date_ns": row["last_date"],
-            "last_message_at": _apple_ns_to_iso(row["last_date"]),
-        }
-        for row in rows
-    ]
-
-
-def _count_messages_since(conn: sqlite3.Connection, chat_id: int, since_ns: int) -> int:
-    """Count messages in a chat since a timestamp, capped at MESSAGE_COUNT_CAP.
-
-    Excludes reactions/tapbacks (associated_message_type 2000-3006).
-    """
-    row = conn.execute("""
-        SELECT COUNT(*) AS cnt
-        FROM chat_message_join cmj
-        JOIN message m ON m.ROWID = cmj.message_id
-        WHERE cmj.chat_id = ?
-          AND m.date >= ?
-          AND (m.associated_message_type IS NULL
-               OR m.associated_message_type < 2000
-               OR m.associated_message_type > 3006)
-    """, (chat_id, since_ns)).fetchone()
-
-    return min(row["cnt"], MESSAGE_COUNT_CAP) if row else 0
-
-
-def _get_group_participants(conn: sqlite3.Connection, chat_id: int) -> list[str]:
-    """Get phone numbers of group chat participants via chat_handle_join."""
-    rows = conn.execute("""
-        SELECT h.id
-        FROM chat_handle_join chj
-        JOIN handle h ON h.ROWID = chj.handle_id
-        WHERE chj.chat_id = ?
-    """, (chat_id,)).fetchall()
-
-    phones = []
+    stats: dict[str, dict] = {}
     for row in rows:
-        handle_id = row["id"] or ""
-        if _is_phone_identifier(handle_id):
-            phones.append(handle_id)
-    return phones
-
-
-def _get_group_sender_stats(
-    conn: sqlite3.Connection, chat_id: int, since_ns: int
-) -> dict[str, dict]:
-    """Get per-sender message counts and last message time for a group chat.
-
-    Returns {sender_phone: {"count": int, "last_message": str | None}}.
-    Excludes reactions/tapbacks and messages from self.
-    """
-    rows = conn.execute("""
-        SELECT h.id AS sender, m.date AS msg_date
-        FROM chat_message_join cmj
-        JOIN message m ON m.ROWID = cmj.message_id
-        LEFT JOIN handle h ON m.handle_id = h.ROWID
-        WHERE cmj.chat_id = ?
-          AND m.date >= ?
-          AND m.is_from_me = 0
-          AND (m.associated_message_type IS NULL
-               OR m.associated_message_type < 2000
-               OR m.associated_message_type > 3006)
-    """, (chat_id, since_ns)).fetchall()
-
-    participants: dict[str, dict] = {}
-    for row in rows:
-        sender = row["sender"] or ""
-        if not sender or "@" in sender or sender.startswith("urn:"):
+        identifier = row["identifier"] or ""
+        if not _is_phone_identifier(identifier):
             continue
+        stats[identifier] = {
+            "count": int(row["msg_count"] or 0),
+            "last_message": _apple_ns_to_iso(row["last_date_ns"]),
+        }
+    return stats
 
-        if sender not in participants:
-            participants[sender] = {"count": 0, "last_message": None}
 
-        p = participants[sender]
-        p["count"] = min(p["count"] + 1, MESSAGE_COUNT_CAP)
+def _list_group_participant_phones() -> set[str]:
+    """Return all phone-like handles that appear in any group conversation."""
+    conn = _open_chat_db()
+    try:
+        rows = conn.execute("""
+            SELECT DISTINCT h.id
+            FROM chat c
+            JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
+            JOIN handle h ON h.ROWID = chj.handle_id
+            WHERE c.chat_identifier LIKE 'chat%'
+        """).fetchall()
+    finally:
+        conn.close()
 
-        iso = _apple_ns_to_iso(row["msg_date"])
-        if iso and (p["last_message"] is None or iso > p["last_message"]):
-            p["last_message"] = iso
-
-    return participants
+    out: set[str] = set()
+    for row in rows:
+        identifier = row["id"] or ""
+        if _is_phone_identifier(identifier):
+            out.add(identifier)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -394,9 +390,8 @@ def _get_group_sender_stats(
 def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bool = False) -> int:
     """Extract iMessage contacts via direct SQLite reads of chat.db.
 
-    Reads all conversations, counts messages for 1:1 chats,
-    flags group chat participants, and outputs the top contacts sorted by
-    message count.
+    Starts from local Contacts.app phone records, then enriches each contact
+    with message counts and recency when iMessage history exists.
 
     Returns the number of contacts written.
     """
@@ -405,39 +400,48 @@ def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bo
     console.print("[bold]Extracting iMessage contacts...[/bold]")
     console.print(f"[dim]Reading {_CHAT_DB} (read-only)[/dim]\n")
 
-    conn = _open_chat_db()
+    if include_small_groups:
+        console.print("[dim]Note: --include-small-groups is now a no-op; full-history counts are always used.[/dim]")
 
-    # List all conversations
-    console.print("[dim]Listing conversations...[/dim]")
-    conversations = _list_conversations(conn)
-    if not conversations:
-        console.print("[yellow]No conversations found[/yellow]")
-        conn.close()
+    console.print("[dim]Loading contacts + full message history...[/dim]")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fut_contacts = pool.submit(_build_contacts_index)
+        fut_stats = pool.submit(_aggregate_handle_message_stats)
+        fut_groups = pool.submit(_list_group_participant_phones)
+
+        contacts_inventory, _ = fut_contacts.result()
+        stats_by_identifier = fut_stats.result()
+        group_participants = fut_groups.result()
+
+    if not contacts_inventory:
+        console.print("[yellow]No local Contacts found[/yellow]")
         return 0
 
-    # Separate 1:1 vs group chats, skip emails/URNs/short codes
-    direct_chats = []
-    group_chats = []
-    for conv in conversations:
-        identifier = conv["identifier"]
-        if _is_group_identifier(identifier):
-            group_chats.append(conv)
-        elif _is_phone_identifier(identifier):
-            direct_chats.append(conv)
+    # Normalize message stats to phone digits so different identifier formats
+    # collapse to one contact.
+    stats_by_normalized: dict[str, dict] = {}
+    for identifier, stat in stats_by_identifier.items():
+        normalized = _normalize_phone(identifier)
+        if len(normalized) < 7:
+            continue
+        current = stats_by_normalized.get(normalized)
+        count = int(stat.get("count", 0) or 0)
+        last_message = stat.get("last_message")
+        if not current:
+            stats_by_normalized[normalized] = {"count": count, "last_message": last_message}
+            continue
+        current["count"] = int(current.get("count", 0) or 0) + count
+        if last_message and (
+            not current.get("last_message") or last_message > current["last_message"]
+        ):
+            current["last_message"] = last_message
 
-    console.print(f"[dim]Found {len(direct_chats)} direct + {len(group_chats)} group conversations[/dim]")
+    group_normalized = {
+        _normalize_phone(identifier)
+        for identifier in group_participants
+        if len(_normalize_phone(identifier)) >= 7
+    }
 
-    # Build phone → name lookup from Contacts
-    console.print("[dim]Loading contacts...[/dim]")
-    name_lookup = _build_contact_name_lookup()
-    console.print()
-
-    now = datetime.now(timezone.utc)
-    cutoff_90d = now - timedelta(days=90)
-    since_ns = _datetime_to_apple_ns(cutoff_90d)
-    contacts_by_phone: dict[str, Contact] = {}
-
-    # Count messages for 1:1 chats
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -445,107 +449,29 @@ def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bo
         TextColumn("{task.completed}/{task.total}"),
         console=console,
     ) as progress:
-        task = progress.add_task("Counting 1:1 messages", total=len(direct_chats))
-
-        for conv in direct_chats:
+        task = progress.add_task("Building contact rows", total=len(contacts_inventory))
+        contacts_by_phone: dict[str, Contact] = {}
+        for phone, name in contacts_inventory.items():
             progress.advance(task)
-            chat_id = conv["id"]
-            identifier = conv["identifier"]
-            last_message_at = conv["last_message_at"]
-            name = name_lookup.get(_normalize_phone(identifier), "")
-
-            # Only count messages if the chat had activity in the last 90 days
-            count = 0
-            last_date_ns = conv["last_date_ns"]
-            if last_date_ns:
-                last_unix = _apple_ns_to_unix(last_date_ns)
-                if last_unix and last_unix >= cutoff_90d.timestamp():
-                    count = _count_messages_since(conn, chat_id, since_ns)
-            else:
-                count = _count_messages_since(conn, chat_id, since_ns)
-
-            new_contact = Contact(
-                phone=identifier,
+            normalized = _normalize_phone(phone)
+            stat = stats_by_normalized.get(normalized, {})
+            msg_count = int(stat.get("count", 0) or 0)
+            contacts_by_phone[phone] = Contact(
+                phone=phone,
                 name=name,
                 source="imessage",
-                message_count=count or None,
-                last_message=last_message_at,
+                is_in_group_chats=normalized in group_normalized,
+                message_count=msg_count or None,
+                last_message=stat.get("last_message"),
             )
-            if identifier in contacts_by_phone:
-                contacts_by_phone[identifier] = merge_contact(contacts_by_phone[identifier], new_contact)
-            else:
-                contacts_by_phone[identifier] = new_contact
 
-    # Process group chats
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed}/{task.total}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Scanning group chats", total=len(group_chats))
-
-        for conv in group_chats:
-            progress.advance(task)
-            chat_id = conv["id"]
-
-            # Skip groups with no activity in 90 days
-            last_date_ns = conv["last_date_ns"]
-            if last_date_ns:
-                last_unix = _apple_ns_to_unix(last_date_ns)
-                if last_unix and last_unix < cutoff_90d.timestamp():
-                    continue
-
-            if include_small_groups:
-                participants = _get_group_sender_stats(conn, chat_id, since_ns)
-                is_small = len(participants) <= SMALL_GROUP_MAX_MEMBERS
-
-                for sender_phone, stats in participants.items():
-                    if not _is_phone_identifier(sender_phone):
-                        continue
-                    name = name_lookup.get(_normalize_phone(sender_phone), "")
-                    if sender_phone in contacts_by_phone:
-                        existing = contacts_by_phone[sender_phone]
-                        existing.is_in_group_chats = True
-                        if is_small:
-                            existing.message_count = min(
-                                (existing.message_count or 0) + stats["count"],
-                                MESSAGE_COUNT_CAP,
-                            )
-                        if stats["last_message"] and (
-                            not existing.last_message or stats["last_message"] > existing.last_message
-                        ):
-                            existing.last_message = stats["last_message"]
-                        if name and not existing.name:
-                            existing.name = name
-                    else:
-                        contacts_by_phone[sender_phone] = Contact(
-                            phone=sender_phone,
-                            name=name,
-                            source="imessage",
-                            is_in_group_chats=True,
-                            message_count=stats["count"] if is_small else None,
-                            last_message=stats["last_message"],
-                        )
-            else:
-                # Default: just flag group participants, don't count messages
-                phones = _get_group_participants(conn, chat_id)
-                for sender_phone in phones:
-                    name = name_lookup.get(_normalize_phone(sender_phone), "")
-                    if sender_phone in contacts_by_phone:
-                        contacts_by_phone[sender_phone].is_in_group_chats = True
-                        if name and not contacts_by_phone[sender_phone].name:
-                            contacts_by_phone[sender_phone].name = name
-                    else:
-                        contacts_by_phone[sender_phone] = Contact(
-                            phone=sender_phone,
-                            name=name,
-                            source="imessage",
-                            is_in_group_chats=True,
-                        )
-
-    conn.close()
+    with_messages = sum(1 for c in contacts_by_phone.values() if c.message_count)
+    in_groups = sum(1 for c in contacts_by_phone.values() if c.is_in_group_chats)
+    console.print(
+        f"[dim]Found {len(contacts_by_phone)} local contacts "
+        f"({with_messages} with iMessage history, "
+        f"{in_groups} in groups)[/dim]"
+    )
 
     # Merge with existing contacts.csv (preserves WhatsApp data)
     existing = load_existing_contacts(output_path)
@@ -555,12 +481,19 @@ def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bo
         else:
             existing[phone] = new_contact
 
-    total_written = write_contacts(existing, output_path, limit=MAX_CONTACTS_OUTPUT)
+    candidates = sync_candidate_catalog()
+    match_stats = apply_local_name_matching(existing, candidates)
 
-    console.print(f"\n[green bold]✅ Extracted top {total_written} contacts (of {len(existing)}) to {output_path}[/green bold]")
+    total_written = write_contacts(existing, output_path)
+
+    console.print(f"\n[green bold]✅ Extracted {total_written} contacts to {output_path}[/green bold]")
+    console.print(
+        f"[dim]Local match results: matched={match_stats['matched']} "
+        f"suggested={match_stats['suggested']} unmatched={match_stats['unmatched']}[/dim]"
+    )
     console.print()
     console.print("[bold]Next steps:[/bold]")
-    console.print(f"  [cyan]contact-exporter llm-review[/cyan]  Auto-classify contacts worth enriching")
+    console.print(f"  [cyan]contact-exporter llm-review[/cyan]  Analyze unmatched contacts")
     console.print(f"  [cyan]contact-exporter upload[/cyan]      Upload to Powerset")
     console.print("[dim]  Use --model to change LLM (default: claude-sonnet-4-6)[/dim]")
 
