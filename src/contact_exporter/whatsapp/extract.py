@@ -33,7 +33,7 @@ from contact_exporter.config import (
 )
 from contact_exporter.matching import apply_local_name_matching, sync_candidate_catalog
 from contact_exporter.merge import load_existing_contacts, merge_contact, write_contacts
-from contact_exporter.models import Contact
+from contact_exporter.models import Contact, canonicalize_phone
 
 console = Console()
 
@@ -854,10 +854,14 @@ def extract_whatsapp(output_path: str = "contacts.csv", reset: bool = False) -> 
 
         existing = load_existing_contacts(output_path)
         for phone, new_contact in wa_contacts.items():
-            if phone in existing:
-                existing[phone] = merge_contact(existing[phone], new_contact)
+            canonical_phone = canonicalize_phone(phone)
+            if not canonical_phone:
+                continue
+            new_contact.phone = canonical_phone
+            if canonical_phone in existing:
+                existing[canonical_phone] = merge_contact(existing[canonical_phone], new_contact)
             else:
-                existing[phone] = new_contact
+                existing[canonical_phone] = new_contact
 
         candidates = sync_candidate_catalog()
         match_stats = apply_local_name_matching(existing, candidates)

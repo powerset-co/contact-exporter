@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
+import unicodedata
 
 CSV_HEADERS = [
     "phone",
@@ -20,6 +22,61 @@ CSV_HEADERS = [
     "match_method",
     "match_reason",
 ]
+
+
+def canonicalize_phone(raw: str) -> str:
+    """Canonicalize a phone-ish identifier for stable CSV merge keys."""
+    value = (raw or "").strip()
+    digits = re.sub(r"[^\d]", "", value)
+    if len(digits) < 7:
+        return ""
+    if value.startswith("+"):
+        return f"+{digits}"
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    if len(digits) <= 15:
+        return f"+{digits}"
+    return digits
+
+
+def is_emoji_only_name(name: str) -> bool:
+    """True when a name contains only emoji/symbol glyphs and separators."""
+    raw = (name or "").strip()
+    if not raw:
+        return False
+    compact = "".join(ch for ch in raw if not ch.isspace())
+    if not compact:
+        return False
+
+    has_symbol = False
+    for ch in compact:
+        if ch in ("\u200d", "\ufe0f"):
+            continue
+        if ch.isalnum():
+            return False
+        cat = unicodedata.category(ch)
+        if cat.startswith(("L", "N")):
+            return False
+        if cat.startswith("P"):
+            continue
+        if cat.startswith("S"):
+            has_symbol = True
+            continue
+        return False
+    return has_symbol
+
+
+def should_auto_skip(contact: "Contact") -> bool:
+    """Default non-controversial skip rules applied before upload/write."""
+    name = (contact.name or "").strip()
+    msg_count = int(contact.message_count or 0)
+    if not name and msg_count == 0:
+        return True
+    if name and is_emoji_only_name(name):
+        return True
+    return False
 
 
 @dataclass

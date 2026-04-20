@@ -5,7 +5,13 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from contact_exporter.models import CSV_HEADERS, Contact
+from contact_exporter.models import (
+    CSV_HEADERS,
+    Contact,
+    canonicalize_phone,
+    is_emoji_only_name,
+    should_auto_skip,
+)
 
 
 def load_existing_contacts(path: str) -> dict[str, Contact]:
@@ -27,12 +33,30 @@ def load_existing_contacts(path: str) -> dict[str, Contact]:
             except (KeyError, ValueError):
                 continue
 
-            if contact.phone in contacts:
-                contacts[contact.phone] = merge_contact(contacts[contact.phone], contact)
+            canonical_phone = canonicalize_phone(contact.phone)
+            if not canonical_phone:
+                continue
+            contact.phone = canonical_phone
+
+            if canonical_phone in contacts:
+                contacts[canonical_phone] = merge_contact(contacts[canonical_phone], contact)
             else:
-                contacts[contact.phone] = contact
+                contacts[canonical_phone] = contact
 
     return contacts
+
+
+def _prefer_name(existing_name: str, new_name: str) -> str:
+    """Prefer a stable human-readable name when merging duplicate phones."""
+    existing = (existing_name or "").strip()
+    new = (new_name or "").strip()
+    if not existing:
+        return new
+    if not new:
+        return existing
+    if is_emoji_only_name(existing) and not is_emoji_only_name(new):
+        return new
+    return existing
 
 
 def merge_contact(existing: Contact, new: Contact) -> Contact:
@@ -67,7 +91,7 @@ def merge_contact(existing: Contact, new: Contact) -> Contact:
 
     return Contact(
         phone=existing.phone,
-        name=existing.name or new.name,
+        name=_prefer_name(existing.name, new.name),
         source=source,
         is_in_group_chats=existing.is_in_group_chats or new.is_in_group_chats,
         message_count=message_count,
@@ -89,8 +113,25 @@ def write_contacts(
     limit: int | None = None,
 ) -> int:
     """Write contacts to CSV, sorted by message count desc."""
+    # Normalize keys up front so old rows like "1415..." and "+1415..." merge.
+    deduped: dict[str, Contact] = {}
+    for contact in contacts.values():
+        canonical_phone = canonicalize_phone(contact.phone)
+        if not canonical_phone:
+            continue
+        contact.phone = canonical_phone
+        if canonical_phone in deduped:
+            deduped[canonical_phone] = merge_contact(deduped[canonical_phone], contact)
+        else:
+            deduped[canonical_phone] = contact
+
+    # Apply deterministic auto-skip rules (preserves explicit manual skips).
+    for contact in deduped.values():
+        if should_auto_skip(contact):
+            contact.skip = True
+
     sorted_contacts = sorted(
-        contacts.values(),
+        deduped.values(),
         key=lambda c: (c.message_count or 0),
         reverse=True,
     )

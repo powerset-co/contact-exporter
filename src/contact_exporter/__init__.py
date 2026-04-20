@@ -1,3 +1,3 @@
 """contact-exporter: Extract iMessage & WhatsApp contacts locally for Powerset."""
 
-__version__ = "0.1.19"
+__version__ = "0.1.21"

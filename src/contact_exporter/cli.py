@@ -27,6 +27,7 @@ from contact_exporter.imessage.extract import extract_imessage
 from contact_exporter.llm_review import review_contacts_llm
 from contact_exporter.matching import apply_local_name_matching, sync_candidate_catalog
 from contact_exporter.merge import load_existing_contacts, write_contacts
+from contact_exporter.research_review import download_research_review, upload_research_review
 from contact_exporter.review import review_contacts
 from contact_exporter.upload import upload_contacts
 from contact_exporter.whatsapp.extract import extract_whatsapp
@@ -140,6 +141,18 @@ def cmd_upload(args):
     upload_contacts(file_path=args.file)
 
 
+def cmd_research_review(args):
+    _apply_api_override(args)
+    if args.upload:
+        upload_research_review(args.upload)
+        return
+    if args.review is not None:
+        artifact_id = None if args.review == "__LATEST__" else args.review
+        download_research_review(artifact_id=artifact_id, output_dir=args.output_dir)
+        return
+    raise SystemExit("Use --upload <csv> or --review [artifact_id]")
+
+
 def cmd_sync_candidates(args):
     _apply_api_override(args)
     candidates = sync_candidate_catalog(catalog_path=args.output, refresh=not args.use_cached)
@@ -225,6 +238,22 @@ def main():
     _add_api_override_flags(upload_parser)
     upload_parser.add_argument("--file", "-f", default="contacts.csv", help="CSV file to upload")
 
+    rr_parser = subparsers.add_parser("research-review", help="Upload or download messages research review artifacts")
+    _add_api_override_flags(rr_parser)
+    rr_group = rr_parser.add_mutually_exclusive_group(required=True)
+    rr_group.add_argument("--upload", metavar="CSV", help="Upload a reviewed messages CSV")
+    rr_group.add_argument(
+        "--review",
+        nargs="?",
+        const="__LATEST__",
+        metavar="ARTIFACT_ID",
+        help="Download latest review artifact or a specific artifact id",
+    )
+    rr_parser.add_argument(
+        "--output-dir",
+        help="Directory to extract downloaded review ZIP into (default: ./messages_research_reviews)",
+    )
+
     sync_parser = subparsers.add_parser("sync-candidates", help="Download operator candidate catalog to local CSV")
     _add_api_override_flags(sync_parser)
     sync_parser.add_argument("--output", "-o", default="powerset_contacts.csv", help="Candidate CSV output path")
@@ -251,6 +280,7 @@ def main():
         "llm-review": cmd_llm_review,
         "review": cmd_review,
         "upload": cmd_upload,
+        "research-review": cmd_research_review,
         "sync-candidates": cmd_sync_candidates,
         "match-local": cmd_match_local,
     }

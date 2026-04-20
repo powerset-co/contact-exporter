@@ -19,7 +19,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from contact_exporter import __version__
-from contact_exporter.models import CSV_HEADERS, Contact
+from contact_exporter.models import (
+    CSV_HEADERS,
+    Contact,
+    canonicalize_phone,
+    is_emoji_only_name,
+    should_auto_skip,
+)
 from contact_exporter.merge import merge_contact, write_contacts, load_existing_contacts
 from contact_exporter.imessage.extract import (
     _normalize_phone,
@@ -60,6 +66,11 @@ check("intl keeps digits", _normalize_phone("+447911123456") == "447911123456")
 check("strips dashes/spaces", _normalize_phone("408-535-4285") == "4085354285")
 check("empty string", _normalize_phone("") == "")
 check("short number", _normalize_phone("911") == "911")
+
+check("canonicalize: US 10-digit", canonicalize_phone("4085354285") == "+14085354285")
+check("canonicalize: keeps +", canonicalize_phone("+447911123456") == "+447911123456")
+check("canonicalize: intl digits => +", canonicalize_phone("447911123456") == "+447911123456")
+check("canonicalize: too short empty", canonicalize_phone("123") == "")
 
 
 # ===================================================================
@@ -182,6 +193,18 @@ check("skip=False round-trips", c4.skip is False)
 
 
 # ===================================================================
+# 6b. Auto-skip rules
+# ===================================================================
+print("\n🚫 Auto-skip rules")
+
+check("emoji-only name detected", is_emoji_only_name("❤️") is True)
+check("letters + emoji is not emoji-only", is_emoji_only_name("Bob ❤️") is False)
+check("empty + 0 messages auto-skip", should_auto_skip(Contact(phone="+1", name="", source="imessage", message_count=None)) is True)
+check("named + 0 messages not auto-skip", should_auto_skip(Contact(phone="+1", name="Bob", source="imessage", message_count=0)) is False)
+check("emoji-only auto-skip", should_auto_skip(Contact(phone="+1", name="😀", source="imessage", message_count=50)) is True)
+
+
+# ===================================================================
 # 7. Merge logic
 # ===================================================================
 print("\n🔀 Contact merge")
@@ -220,7 +243,7 @@ import tempfile
 import os
 
 contacts = {
-    f"+{i}": Contact(phone=f"+{i}", name=f"User{i}", source="imessage",
+    f"+14155550{i:02d}": Contact(phone=f"+14155550{i:02d}", name=f"User{i}", source="imessage",
                       message_count=i)
     for i in range(1, 11)
 }
@@ -239,6 +262,28 @@ try:
           f"got counts {counts}")
 finally:
     os.unlink(tmp_path)
+
+# Dedup and auto-skip during write
+with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+    tmp_path2 = f.name
+
+try:
+    mixed = {
+        "a": Contact(phone="+14155551234", name="Candela", source="imessage", message_count=10),
+        "b": Contact(phone="14155551234", name="Candela Whatsapp", source="whatsapp", message_count=5),
+        "c": Contact(phone="+14155550000", name="", source="imessage", message_count=0),
+        "d": Contact(phone="+14155550001", name="❤️", source="whatsapp", message_count=2),
+    }
+    write_contacts(mixed, tmp_path2)
+    loaded2 = load_existing_contacts(tmp_path2)
+    check("dedupe +/non+ phone variants", len(loaded2) == 3, f"got {len(loaded2)} rows")
+    merged_candela = loaded2.get("+14155551234")
+    check("merged row exists", merged_candela is not None)
+    check("sources merged after dedupe", merged_candela.source == "imessage,whatsapp", merged_candela.source if merged_candela else "")
+    check("empty+0 marked skip", loaded2["+14155550000"].skip is True)
+    check("emoji-only marked skip", loaded2["+14155550001"].skip is True)
+finally:
+    os.unlink(tmp_path2)
 
 
 # ===================================================================

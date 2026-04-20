@@ -23,7 +23,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 
 from contact_exporter.matching import apply_local_name_matching, sync_candidate_catalog
 from contact_exporter.merge import load_existing_contacts, merge_contact, write_contacts
-from contact_exporter.models import Contact
+from contact_exporter.models import Contact, canonicalize_phone
 
 console = Console()
 
@@ -182,17 +182,7 @@ def _canonical_contact_phone(phone_raw: str) -> str:
     Prefer E.164-like output for US/CA numbers so iMessage and WhatsApp rows
     converge more often on the same key.
     """
-    raw = (phone_raw or "").strip()
-    digits = re.sub(r"[^\d]", "", raw)
-    if len(digits) < 7:
-        return ""
-    if raw.startswith("+"):
-        return f"+{digits}"
-    if len(digits) == 10:
-        return f"+1{digits}"
-    if len(digits) == 11 and digits.startswith("1"):
-        return f"+{digits}"
-    return digits
+    return canonicalize_phone(phone_raw)
 
 
 def _add_contact_entry(contacts: dict[str, str], phone_raw: str, name: str) -> None:
@@ -476,10 +466,14 @@ def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bo
     # Merge with existing contacts.csv (preserves WhatsApp data)
     existing = load_existing_contacts(output_path)
     for phone, new_contact in contacts_by_phone.items():
-        if phone in existing:
-            existing[phone] = merge_contact(existing[phone], new_contact)
+        canonical_phone = canonicalize_phone(phone)
+        if not canonical_phone:
+            continue
+        new_contact.phone = canonical_phone
+        if canonical_phone in existing:
+            existing[canonical_phone] = merge_contact(existing[canonical_phone], new_contact)
         else:
-            existing[phone] = new_contact
+            existing[canonical_phone] = new_contact
 
     candidates = sync_candidate_catalog()
     match_stats = apply_local_name_matching(existing, candidates)

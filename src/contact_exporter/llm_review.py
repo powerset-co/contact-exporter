@@ -28,6 +28,7 @@ OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "anthropic/claude-sonnet-4-6"
 BATCH_SIZE = 40
 _DEFAULT_REVIEW_MATCH_STATUSES = {"unmatched", "suggested"}
+_PREVIEW_ROWS_PER_VERDICT = 20
 
 # Pricing per 1M tokens (USD) — for cost estimates
 _MODEL_PRICING = {
@@ -356,25 +357,47 @@ def review_contacts_llm(
 
     console.print()
 
-    # Show results table
-    table = Table(title="Review Results", show_lines=False)
-    table.add_column("Name", style="bold", max_width=30)
-    table.add_column("Verdict", justify="center")
-    table.add_column("Msgs", justify="right")
-    table.add_column("Reason", style="dim", max_width=40)
+    # Show a bounded preview so very large contact books stay readable.
+    by_message_desc = sorted(contacts, key=lambda x: -x["message_count"])
+    enrich_preview = [c for c in by_message_desc if all_verdicts.get(c["phone"]) == "ENRICH"][:_PREVIEW_ROWS_PER_VERDICT]
+    skip_preview = [c for c in by_message_desc if all_verdicts.get(c["phone"]) == "SKIP"][:_PREVIEW_ROWS_PER_VERDICT]
 
-    for c in sorted(contacts, key=lambda x: (all_verdicts.get(x["phone"], ""), -x["message_count"])):
-        phone = c["phone"]
-        verdict = all_verdicts.get(phone, "?")
-        style = "green" if verdict == "ENRICH" else "red" if verdict == "SKIP" else "yellow"
-        table.add_row(
-            c["name"],
-            f"[{style}]{verdict}[/{style}]",
-            str(c["message_count"] or ""),
-            all_reasons.get(phone, ""),
+    def _render_preview(title: str, rows: list[dict], verdict: str, style: str) -> None:
+        table = Table(title=title, show_lines=False)
+        table.add_column("Name", style="bold", max_width=30)
+        table.add_column("Verdict", justify="center")
+        table.add_column("Msgs", justify="right")
+        table.add_column("Reason", style="dim", max_width=40)
+        for c in rows:
+            phone = c["phone"]
+            table.add_row(
+                c["name"],
+                f"[{style}]{verdict}[/{style}]",
+                str(c["message_count"] or ""),
+                all_reasons.get(phone, ""),
+            )
+        console.print(table)
+
+    _render_preview(
+        f"Review Results (ENRICH preview: {len(enrich_preview)}/{enrich_count})",
+        enrich_preview,
+        "ENRICH",
+        "green",
+    )
+    _render_preview(
+        f"Review Results (SKIP preview: {len(skip_preview)}/{skip_count})",
+        skip_preview,
+        "SKIP",
+        "red",
+    )
+
+    enrich_hidden = max(enrich_count - len(enrich_preview), 0)
+    skip_hidden = max(skip_count - len(skip_preview), 0)
+    if enrich_hidden or skip_hidden:
+        console.print(
+            f"[dim]Preview capped at {_PREVIEW_ROWS_PER_VERDICT} per verdict "
+            f"(hidden: ENRICH={enrich_hidden}, SKIP={skip_hidden})[/dim]"
         )
-
-    console.print(table)
 
     # Cost summary
     pricing = _MODEL_PRICING.get(model, {"input": 2.0, "output": 8.0})
