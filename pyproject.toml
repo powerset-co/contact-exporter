@@ -1,6 +1,6 @@
 [project]
 name = "contact-exporter"
-version = "0.1.22"
+version = "0.1.23"
 description = "Extract iMessage & WhatsApp contacts locally for Powerset"
 requires-python = ">=3.10"
 license = {text = "MIT"}

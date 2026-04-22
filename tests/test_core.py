@@ -7,8 +7,10 @@ version consistency, and install script syntax.
 
 import csv
 import io
+import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -38,6 +40,8 @@ from contact_exporter.whatsapp.extract import (
     _parse_timestamp,
     _render_qr_to_terminal,
 )
+from contact_exporter.matching import _candidate_name, apply_local_name_matching, PowersetCandidate
+from contact_exporter.llm_review import _load_contacts_for_review
 
 passed = 0
 failed = 0
@@ -107,6 +111,111 @@ check("short number rejected", len(lookup2) == 0)
 lookup3: dict[str, str] = {}
 _add_phone_to_lookup(lookup3, "+14085354285", "   ")
 check("blank name rejected", len(lookup3) == 0)
+
+
+# ===================================================================
+# 3b. Candidate name preference
+# ===================================================================
+print("\n🧾 Candidate name preference")
+
+check(
+    "display suffix prefers first+last",
+    _candidate_name(
+        {
+            "display_name": "Alex (via Google Sheets)",
+            "first_name": "Alex",
+            "last_name": "Oppenheimer",
+            "public_identifier": "alex-oppenheimer",
+        }
+    ) == "Alex Oppenheimer",
+)
+check(
+    "display differs but first+last wins",
+    _candidate_name(
+        {
+            "display_name": "Alex (Some Source Label)",
+            "first_name": "Alex",
+            "last_name": "Oppenheimer",
+            "public_identifier": "alex-oppenheimer",
+        }
+    ) == "Alex Oppenheimer",
+)
+check(
+    "normal display name preserved",
+    _candidate_name(
+        {
+            "display_name": "Alex Oppenheimer",
+            "first_name": "Alex",
+            "last_name": "Oppenheimer",
+            "public_identifier": "alex-oppenheimer",
+        }
+    ) == "Alex Oppenheimer",
+)
+
+# Rows already matched to a person should not enter default review queue.
+with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f_review:
+    review_csv = f_review.name
+try:
+    with open(review_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        w.writeheader()
+        w.writerow({
+            "phone": "+14155550000",
+            "name": "Matched Person",
+            "source": "imessage",
+            "is_in_group_chats": "false",
+            "message_count": "3",
+            "last_message": "",
+            "skip": "",
+            "match_status": "unmatched",  # stale/incorrect status
+            "matched_person_id": "11111111-1111-1111-1111-111111111111",
+            "matched_name": "Matched Person",
+            "matched_linkedin_url": "",
+            "match_confidence": "1.0",
+            "match_method": "name_exact_linkedin",
+            "match_reason": "Unique exact match",
+        })
+        w.writerow({
+            "phone": "+14155550001",
+            "name": "Needs Review",
+            "source": "imessage",
+            "is_in_group_chats": "false",
+            "message_count": "1",
+            "last_message": "",
+            "skip": "",
+            "match_status": "unmatched",
+            "matched_person_id": "",
+            "matched_name": "",
+            "matched_linkedin_url": "",
+            "match_confidence": "",
+            "match_method": "unmatched",
+            "match_reason": "No candidate",
+        })
+    queued = _load_contacts_for_review(review_csv, include_matched=False)
+    check("review excludes rows with matched_person_id", len(queued) == 1, f"got {len(queued)}")
+    check("review keeps unresolved rows", queued and queued[0]["name"] == "Needs Review")
+finally:
+    os.unlink(review_csv)
+
+# Prefix + last-name match should beat generic fuzzy same-last-name.
+prefix_contacts = {
+    "+14150000000": Contact(phone="+14150000000", name="Amir Moazami", source="imessage"),
+}
+prefix_candidates = [
+    PowersetCandidate(id="amirteymour", name="Amirteymour Moazami"),
+    PowersetCandidate(id="yasmine", name="Yasmine Moazami"),
+    PowersetCandidate(id="mohsen", name="Mohsen Moazami"),
+]
+prefix_stats = apply_local_name_matching(prefix_contacts, prefix_candidates)
+pref = prefix_contacts["+14150000000"]
+check("prefix+lastname promotes matched", pref.match_status == "matched", pref.match_status or "")
+check("prefix+lastname picks Amirteymour", pref.matched_person_id == "amirteymour", pref.matched_person_id or "")
+check(
+    "prefix+lastname method tagged",
+    pref.match_method == "name_prefix_lastname_linkedin",
+    pref.match_method or "",
+)
+check("prefix+lastname counted matched", prefix_stats.get("matched", 0) == 1, str(prefix_stats))
 
 
 # ===================================================================

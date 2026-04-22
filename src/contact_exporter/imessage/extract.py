@@ -377,7 +377,11 @@ def _list_group_participant_phones() -> set[str]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bool = False) -> int:
+def extract_imessage(
+    output_path: str = "contacts.csv",
+    include_small_groups: bool = False,
+    operator_id: str | None = None,
+) -> int:
     """Extract iMessage contacts via direct SQLite reads of chat.db.
 
     Starts from local Contacts.app phone records, then enriches each contact
@@ -475,7 +479,7 @@ def extract_imessage(output_path: str = "contacts.csv", include_small_groups: bo
         else:
             existing[canonical_phone] = new_contact
 
-    candidates = sync_candidate_catalog()
+    candidates = sync_candidate_catalog(operator_id=operator_id)
     match_stats = apply_local_name_matching(existing, candidates)
 
     total_written = write_contacts(existing, output_path)

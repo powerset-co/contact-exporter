@@ -101,8 +101,13 @@ def _load_contacts_for_review(csv_path: str, include_matched: bool = False) -> l
             if not name:
                 continue
             match_status = (row.get("match_status") or "").strip().lower()
+            matched_person_id = (row.get("matched_person_id") or "").strip()
             # Treat empty status as unmatched for legacy rows.
             effective_status = match_status or "unmatched"
+            # Hard guard: if we already have a concrete person match, don't send
+            # this row for enrichment review unless explicitly requested.
+            if matched_person_id:
+                effective_status = "matched"
             if not include_matched and effective_status not in _DEFAULT_REVIEW_MATCH_STATUSES:
                 continue
             contacts.append({
@@ -114,6 +119,7 @@ def _load_contacts_for_review(csv_path: str, include_matched: bool = False) -> l
                 "last_message": row.get("last_message", ""),
                 "skip": row.get("skip", ""),
                 "match_status": effective_status,
+                "matched_person_id": matched_person_id,
             })
     return contacts
 

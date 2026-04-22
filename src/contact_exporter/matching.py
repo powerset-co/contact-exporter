@@ -66,6 +66,15 @@ def _normalize_name(raw: Optional[str]) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _first_name_prefix_match(contact_first: str, candidate_first: str) -> bool:
+    """Return True when first names look like strong prefix variants."""
+    a = (contact_first or "").strip()
+    b = (candidate_first or "").strip()
+    if len(a) < 4 or len(b) < 4:
+        return False
+    return a.startswith(b) or b.startswith(a)
+
+
 def _normalize_phone(raw: Optional[str]) -> str:
     digits = re.sub(r"\D", "", raw or "")
     if len(digits) == 11 and digits.startswith("1"):
@@ -75,11 +84,16 @@ def _normalize_phone(raw: Optional[str]) -> str:
 
 def _candidate_name(row: dict) -> str:
     display = (row.get("display_name") or "").strip()
-    if display:
-        return display
     first = (row.get("first_name") or "").strip()
     last = (row.get("last_name") or "").strip()
     full = " ".join(part for part in [first, last] if part).strip()
+
+    # Prefer structured name fields (person-backed on /v2/contacts) when we have
+    # both sides of the name; display_name can include source labels/suffixes.
+    if first and last:
+        return full
+    if display:
+        return display
     if full:
         return full
     return (row.get("public_identifier") or "").strip()
@@ -88,6 +102,7 @@ def _candidate_name(row: dict) -> str:
 def fetch_operator_candidates(
     *,
     page_size: int = 200,
+    operator_id: Optional[str] = None,
 ) -> List[PowersetCandidate]:
     """Download all candidate contacts visible to the authenticated operator."""
     headers = get_auth_header()
@@ -98,16 +113,20 @@ def fetch_operator_candidates(
     total_count = None
 
     while True:
+        params = {
+            "page": page,
+            "page_size": page_size,
+            "sort_field": "first_name",
+            "sort_dir": "asc",
+            "include_fields": _CONTACTS_INCLUDE_FIELDS,
+        }
+        if operator_id:
+            params["operator_id"] = operator_id
+
         resp = requests.get(
             f"{api_base_url}/v2/contacts",
             headers=headers,
-            params={
-                "page": page,
-                "page_size": page_size,
-                "sort_field": "first_name",
-                "sort_dir": "asc",
-                "include_fields": _CONTACTS_INCLUDE_FIELDS,
-            },
+            params=params,
             timeout=60,
         )
 
@@ -206,6 +225,7 @@ def sync_candidate_catalog(
     *,
     catalog_path: str = "powerset_contacts.csv",
     refresh: bool = True,
+    operator_id: Optional[str] = None,
 ) -> List[PowersetCandidate]:
     """Refresh candidate catalog from API.
 
@@ -217,9 +237,10 @@ def sync_candidate_catalog(
         return load_candidates_csv(catalog_path)
 
     try:
-        candidates = fetch_operator_candidates()
+        candidates = fetch_operator_candidates(operator_id=operator_id)
         save_candidates_csv(candidates, catalog_path)
-        console.print(f"[dim]Downloaded {len(candidates)} operator candidates → {cache_path}[/dim]")
+        suffix = f" (operator_id={operator_id})" if operator_id else ""
+        console.print(f"[dim]Downloaded {len(candidates)} operator candidates{suffix} → {cache_path}[/dim]")
         return candidates
     except SystemExit:
         if cache_path.exists():
@@ -351,6 +372,50 @@ def apply_local_name_matching(
         if not pool:
             unmatched += 1
             _set_unmatched(contact, "No same-last-name candidates")
+            continue
+
+        # If exactly one same-last-name candidate has a strong first-name
+        # prefix relationship (e.g., "amir" vs "amirteymour"), promote it.
+        contact_first = tokens[0]
+        prefix_pool = []
+        for cand in pool:
+            cand_tokens = cand.normalized_name.split(" ")
+            cand_first = cand_tokens[0] if cand_tokens else ""
+            if _first_name_prefix_match(contact_first, cand_first):
+                prefix_pool.append(cand)
+
+        if len(prefix_pool) == 1:
+            cand = prefix_pool[0]
+            confidence = round(
+                max(0.95, SequenceMatcher(None, normalized_contact, cand.normalized_name).ratio()),
+                3,
+            )
+            matched += 1
+            _set_match(
+                contact,
+                status="matched",
+                candidate=cand,
+                confidence=confidence,
+                method="name_prefix_lastname_linkedin",
+                reason="Unique first-name prefix with same last name",
+            )
+            continue
+        if len(prefix_pool) > 1:
+            scored_prefix = sorted(
+                [(SequenceMatcher(None, normalized_contact, cand.normalized_name).ratio(), cand) for cand in prefix_pool],
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            best_score, best_candidate = scored_prefix[0]
+            suggested += 1
+            _set_match(
+                contact,
+                status="suggested",
+                candidate=best_candidate,
+                confidence=round(float(max(best_score, 0.85)), 3),
+                method="name_prefix_lastname_suggested",
+                reason=f"{len(prefix_pool)} prefix candidates with same last name",
+            )
             continue
 
         scored = sorted(

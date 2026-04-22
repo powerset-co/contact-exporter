@@ -815,7 +815,11 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def extract_whatsapp(output_path: str = "contacts.csv", reset: bool = False) -> int:
+def extract_whatsapp(
+    output_path: str = "contacts.csv",
+    reset: bool = False,
+    operator_id: str | None = None,
+) -> int:
     """Extract WhatsApp contacts via a local WAHA Docker container.
 
     Reuses an existing container if already running and authenticated.
@@ -863,7 +867,7 @@ def extract_whatsapp(output_path: str = "contacts.csv", reset: bool = False) -> 
             else:
                 existing[canonical_phone] = new_contact
 
-        candidates = sync_candidate_catalog()
+        candidates = sync_candidate_catalog(operator_id=operator_id)
         match_stats = apply_local_name_matching(existing, candidates)
 
         total_written = write_contacts(existing, output_path)
