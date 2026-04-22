@@ -153,6 +153,9 @@ class _ResearchRow:
     original_bucket: str
 
 
+_RESEARCH_TABS: tuple[str, str, str] = ("yes", "maybe", "no")
+
+
 def _bucket_group(bucket: str) -> int:
     b = (bucket or "").strip().lower()
     if b in {"yes", "confident"}:
@@ -169,6 +172,17 @@ def _bucket_label(bucket: str) -> str:
     if b in {"maybe", "medium"}:
         return "maybe"
     return "no"
+
+
+def _normalize_tab(tab: str | None) -> str:
+    raw = (tab or "").strip().lower()
+    if raw in {"y", "yes"}:
+        return "yes"
+    if raw in {"m", "maybe"}:
+        return "maybe"
+    if raw in {"n", "no"}:
+        return "no"
+    return "yes"
 
 
 def _trunc(text: str, max_len: int) -> str:
@@ -236,7 +250,9 @@ def _render_research_card(
     city = (data.get("location_city") or "").strip()
     country = (data.get("location_country") or "").strip()
     location = ", ".join(part for part in [city, country] if part) or "—"
-    company = ((data.get("top_companies") or "").split("|")[0]).strip() or "—"
+    companies = " | ".join(part.strip() for part in (data.get("top_companies") or "").split("|") if part.strip()) or "—"
+    raw_pairs = (data.get("top_title_company_pairs") or "").strip()
+    title_company_pairs = " | ".join(part.strip() for part in raw_pairs.split("|") if part.strip()) or "—"
     education = ((data.get("schools") or "").split("|")[0]).strip() or "—"
     reason = (data.get("short_reason") or "").strip() or "—"
 
@@ -249,7 +265,8 @@ def _render_research_card(
     body_lines.extend(_wrap_plain(f"{head}  {head_meta}", inner_w))
     body_lines.extend(_wrap_prefixed("phone: ", phone, inner_w))
     body_lines.extend(_wrap_prefixed("location: ", location, inner_w))
-    body_lines.extend(_wrap_prefixed("company: ", company, inner_w))
+    body_lines.extend(_wrap_prefixed("title@company: ", title_company_pairs, inner_w))
+    body_lines.extend(_wrap_prefixed("companies: ", companies, inner_w))
     body_lines.extend(_wrap_prefixed("education: ", education, inner_w))
     body_lines.extend(_wrap_prefixed("reason: ", reason, inner_w))
 
@@ -262,8 +279,14 @@ def _render_research_card(
     return card
 
 
-def _run_research_tui(stdscr, rows: list[_ResearchRow], batch_size: int) -> bool | None:
-    """Review messages-research rows in fixed-size batches (yes-first order)."""
+def _run_research_tui(
+    stdscr,
+    rows: list[_ResearchRow],
+    batch_size: int,
+    initial_tab: str,
+    initial_selected: list[bool],
+) -> bool | None:
+    """Review messages-research rows using YES/MAYBE/NO tabbed cards."""
     curses.curs_set(0)
     curses.use_default_colors()
     stdscr.keypad(True)
@@ -277,104 +300,182 @@ def _run_research_tui(stdscr, rows: list[_ResearchRow], batch_size: int) -> bool
     curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_WHITE)  # current row
 
     total = len(rows)
-    selected = [True] * total  # selected=True => keep/include, False => exclude
-    cursor = 0
-    # Cached from render pass; used by mouse hit-testing in this frame.
+    if len(initial_selected) == total:
+        selected = list(initial_selected)
+    else:
+        selected = [True] * total
+
+    active_tab = _normalize_tab(initial_tab)
+    cursor_pos_by_tab: dict[str, int] = {tab: 0 for tab in _RESEARCH_TABS}
     line_to_idx: dict[int, int] = {}
+    tab_segments: list[tuple[int, int, str]] = []
 
     while True:
         stdscr.clear()
         height, width = stdscr.getmaxyx()
+        width_safe = max(1, width)
 
-        total_batches = (total + batch_size - 1) // batch_size
-        batch_idx = cursor // batch_size
-        batch_start = batch_idx * batch_size
-        batch_end = min(total, batch_start + batch_size)
+        indices_by_tab: dict[str, list[int]] = {
+            tab: [i for i, row in enumerate(rows) if _bucket_label(row.data.get("bucket", "")) == tab]
+            for tab in _RESEARCH_TABS
+        }
+        tab_indices = indices_by_tab[active_tab]
+        tab_total = len(tab_indices)
+
+        cursor_pos = cursor_pos_by_tab[active_tab]
+        if tab_total == 0:
+            cursor_pos = 0
+        else:
+            cursor_pos = max(0, min(cursor_pos, tab_total - 1))
+        cursor_pos_by_tab[active_tab] = cursor_pos
+
+        total_batches = max(1, (tab_total + batch_size - 1) // batch_size)
+        batch_idx = (cursor_pos // batch_size) if tab_total else 0
+        batch_start_pos = batch_idx * batch_size
+        batch_end_pos = min(tab_total, batch_start_pos + batch_size)
 
         kept = sum(selected)
         excluded = total - kept
-        header = (
-            f"  Review Messages CSV — batch {batch_idx + 1}/{total_batches} "
-            f"(yes first)  keep={kept} exclude={excluded}"
+        mode_hint = (
+            "YES mode: deselect rows you want excluded"
+            if active_tab == "yes"
+            else f"{active_tab.upper()} mode: select rows you want included"
         )
-        stdscr.addnstr(0, 0, header, width - 1, curses.color_pair(3) | curses.A_BOLD)
-        stdscr.addnstr(1, 0, "─" * min(width - 1, 120), width - 1, curses.color_pair(3))
+        header = (
+            f"  Review Messages CSV — {active_tab.upper()} batch {batch_idx + 1}/{total_batches}  "
+            f"keep={kept} exclude={excluded}"
+        )
+        stdscr.addnstr(0, 0, header, width_safe - 1, curses.color_pair(3) | curses.A_BOLD)
 
-        # Full-width "packet" cards with wrapped fields.
-        # Cursor-centered viewport inside current batch.
-        cards_top_y = 2
+        tab_segments = []
+        tabs_count = len(_RESEARCH_TABS)
+        seg_base = width_safe // tabs_count
+        seg_remainder = width_safe % tabs_count
+        x = 0
+        for i, tab in enumerate(_RESEARCH_TABS):
+            seg_w = seg_base + (1 if i < seg_remainder else 0)
+            if seg_w <= 0:
+                continue
+            label = f" {tab.upper()} ".center(seg_w)
+            count = f"{len(indices_by_tab[tab])} rows".center(seg_w)
+            attr = curses.color_pair(3) | curses.A_BOLD
+            if tab == active_tab:
+                attr |= curses.A_REVERSE
+            stdscr.addnstr(1, x, label, seg_w, attr)
+            stdscr.addnstr(2, x, count, seg_w, attr)
+            tab_segments.append((x, x + seg_w, tab))
+            x += seg_w
+
+        stdscr.addnstr(3, 0, f"  {mode_hint}", width_safe - 1, curses.color_pair(3))
+        stdscr.addnstr(4, 0, "─" * min(width_safe - 1, 140), width_safe - 1, curses.color_pair(3))
+
+        cards_top_y = 5
         footer_y = height - 1
         available_lines = max(1, footer_y - cards_top_y)
-        card_width = max(20, width - 1)
-
-        cards_by_idx: dict[int, list[str]] = {}
-        card_heights: dict[int, int] = {}
-        for idx in range(batch_start, batch_end):
-            ordinal = idx - batch_start + 1
-            card_lines = _render_research_card(
-                rows[idx],
-                selected=selected[idx],
-                ordinal=ordinal,
-                card_width=card_width,
-            )
-            cards_by_idx[idx] = card_lines
-            card_heights[idx] = len(card_lines)
-
-        # Keep cursor visible by expanding around it.
-        visible_start = cursor
-        used = card_heights[cursor]
-        while visible_start > batch_start and used + card_heights[visible_start - 1] <= available_lines:
-            visible_start -= 1
-            used += card_heights[visible_start]
-        visible_end = cursor + 1
-        while visible_end < batch_end and used + card_heights[visible_end] <= available_lines:
-            used += card_heights[visible_end]
-            visible_end += 1
+        card_width = max(20, width_safe - 1)
 
         line_to_idx = {}
-        row_y = cards_top_y
-        for idx in range(visible_start, visible_end):
-            if row_y >= footer_y:
-                break
-            if idx == cursor:
-                attr = curses.color_pair(4)
-            elif selected[idx]:
-                attr = curses.color_pair(1)
-            else:
-                attr = curses.color_pair(2)
+        if tab_total == 0:
+            empty = "  No rows in this tab. Use LEFT/RIGHT or 1/2/3 to switch tabs."
+            stdscr.addnstr(cards_top_y, 0, empty, width_safe - 1, curses.color_pair(3))
+        else:
+            batch_indices = tab_indices[batch_start_pos:batch_end_pos]
+            cards_by_idx: dict[int, list[str]] = {}
+            card_heights: dict[int, int] = {}
+            for ordinal, idx in enumerate(batch_indices, start=batch_start_pos + 1):
+                card_lines = _render_research_card(
+                    rows[idx],
+                    selected=selected[idx],
+                    ordinal=ordinal,
+                    card_width=card_width,
+                )
+                cards_by_idx[idx] = card_lines
+                card_heights[idx] = len(card_lines)
 
-            for line in cards_by_idx[idx]:
+            visible_start_pos = cursor_pos
+            cursor_idx = tab_indices[cursor_pos]
+            used = card_heights[cursor_idx]
+
+            while (
+                visible_start_pos > batch_start_pos
+                and used + card_heights[tab_indices[visible_start_pos - 1]] <= available_lines
+            ):
+                visible_start_pos -= 1
+                used += card_heights[tab_indices[visible_start_pos]]
+
+            visible_end_pos = cursor_pos + 1
+            while (
+                visible_end_pos < batch_end_pos
+                and used + card_heights[tab_indices[visible_end_pos]] <= available_lines
+            ):
+                used += card_heights[tab_indices[visible_end_pos]]
+                visible_end_pos += 1
+
+            row_y = cards_top_y
+            for tab_pos in range(visible_start_pos, visible_end_pos):
                 if row_y >= footer_y:
                     break
-                stdscr.addnstr(row_y, 0, line, width - 1, attr)
-                line_to_idx[row_y] = idx
-                row_y += 1
+                idx = tab_indices[tab_pos]
+                if tab_pos == cursor_pos:
+                    attr = curses.color_pair(4)
+                elif selected[idx]:
+                    attr = curses.color_pair(1)
+                else:
+                    attr = curses.color_pair(2)
 
+                for line in cards_by_idx[idx]:
+                    if row_y >= footer_y:
+                        break
+                    stdscr.addnstr(row_y, 0, line, width_safe - 1, attr)
+                    line_to_idx[row_y] = idx
+                    row_y += 1
+
+        primary_batch = "x deselect batch" if active_tab == "yes" else "s select batch"
         footer = (
-            "  ↑/↓ navigate  SPACE/click toggle  n/p next/prev batch  "
-            "a all  x exclude batch  ENTER save  q cancel"
+            f"  ←/→ tabs  1/2/3 tabs  ↑/↓ navigate  SPACE/click toggle  {primary_batch}  "
+            "n/p next/prev batch  ENTER save  q cancel"
         )
-        stdscr.addnstr(height - 1, 0, footer, width - 1, curses.color_pair(3))
+        stdscr.addnstr(height - 1, 0, footer, width_safe - 1, curses.color_pair(3))
         stdscr.refresh()
 
         key = stdscr.getch()
-        if key == curses.KEY_UP and cursor > 0:
-            cursor -= 1
-        elif key == curses.KEY_DOWN and cursor < total - 1:
-            cursor += 1
-        elif key == ord(" "):
-            selected[cursor] = not selected[cursor]
+
+        def _switch_tab(delta: int) -> None:
+            nonlocal active_tab
+            tab_i = _RESEARCH_TABS.index(active_tab)
+            active_tab = _RESEARCH_TABS[(tab_i + delta) % len(_RESEARCH_TABS)]
+
+        if key == curses.KEY_LEFT:
+            _switch_tab(-1)
+        elif key == curses.KEY_RIGHT:
+            _switch_tab(1)
+        elif key in (ord("1"), ord("2"), ord("3")):
+            active_tab = _RESEARCH_TABS[int(chr(key)) - 1]
+        elif key == curses.KEY_UP and tab_total > 0 and cursor_pos > 0:
+            cursor_pos_by_tab[active_tab] = cursor_pos - 1
+        elif key == curses.KEY_DOWN and tab_total > 0 and cursor_pos < tab_total - 1:
+            cursor_pos_by_tab[active_tab] = cursor_pos + 1
+        elif key == ord(" ") and tab_total > 0:
+            idx = tab_indices[cursor_pos]
+            selected[idx] = not selected[idx]
         elif key == ord("a"):
-            selected = [True] * total
+            for idx in tab_indices:
+                selected[idx] = True
+        elif key == ord("d"):
+            for idx in tab_indices:
+                selected[idx] = False
+        elif key == ord("s"):
+            for tab_pos in range(batch_start_pos, batch_end_pos):
+                selected[tab_indices[tab_pos]] = True
         elif key == ord("x"):
-            for i in range(batch_start, batch_end):
-                selected[i] = False
+            for tab_pos in range(batch_start_pos, batch_end_pos):
+                selected[tab_indices[tab_pos]] = False
         elif key == ord("n"):
-            if batch_idx < total_batches - 1:
-                cursor = min(total - 1, (batch_idx + 1) * batch_size)
+            if tab_total > 0 and batch_idx < total_batches - 1:
+                cursor_pos_by_tab[active_tab] = min(tab_total - 1, (batch_idx + 1) * batch_size)
         elif key == ord("p"):
-            if batch_idx > 0:
-                cursor = (batch_idx - 1) * batch_size
+            if tab_total > 0 and batch_idx > 0:
+                cursor_pos_by_tab[active_tab] = (batch_idx - 1) * batch_size
         elif key in (curses.KEY_ENTER, 10, 13):
             for i, row in enumerate(rows):
                 if selected[i]:
@@ -386,33 +487,41 @@ def _run_research_tui(stdscr, rows: list[_ResearchRow], batch_size: int) -> bool
             return True
         elif key in (ord("q"), 27):
             return False
-        elif key == curses.KEY_PPAGE:
-            cursor = max(0, batch_start - batch_size)
-        elif key == curses.KEY_NPAGE:
-            cursor = min(total - 1, batch_start + batch_size)
-        elif key == curses.KEY_HOME:
-            cursor = 0
-        elif key == curses.KEY_END:
-            cursor = total - 1
+        elif key == curses.KEY_HOME and tab_total > 0:
+            cursor_pos_by_tab[active_tab] = 0
+        elif key == curses.KEY_END and tab_total > 0:
+            cursor_pos_by_tab[active_tab] = tab_total - 1
+        elif key == curses.KEY_PPAGE and tab_total > 0:
+            cursor_pos_by_tab[active_tab] = max(0, batch_start_pos - batch_size)
+        elif key == curses.KEY_NPAGE and tab_total > 0:
+            cursor_pos_by_tab[active_tab] = min(tab_total - 1, batch_start_pos + batch_size)
         elif key == curses.KEY_MOUSE and _MOUSE_LEFT_MASK:
             try:
-                _id, _mx, my, _mz, bstate = curses.getmouse()
+                _id, mx, my, _mz, bstate = curses.getmouse()
             except curses.error:
                 continue
             if not (bstate & _MOUSE_LEFT_MASK):
                 continue
+            if my in (1, 2):
+                for start_x, end_x, tab in tab_segments:
+                    if start_x <= mx < end_x:
+                        active_tab = tab
+                        break
+                continue
             idx = line_to_idx.get(my)
             if idx is not None:
-                cursor = idx
+                current_tab_indices = indices_by_tab[active_tab]
+                if idx in current_tab_indices:
+                    cursor_pos_by_tab[active_tab] = current_tab_indices.index(idx)
                 selected[idx] = not selected[idx]
 
 
 def _is_research_csv(fieldnames: list[str]) -> bool:
-    required = {"bucket", "full_name", "phone_e164"}
+    required = {"bucket", "full_name", "phone_e164", "top_title_company_pairs"}
     return required.issubset(set(fieldnames or []))
 
 
-def _review_research_csv(file_path: str, batch_size: int) -> None:
+def _review_research_csv(file_path: str, batch_size: int, initial_tab: str) -> None:
     path = Path(file_path)
     if not path.exists():
         console.print(f"[yellow]File not found: {file_path}[/yellow]")
@@ -427,11 +536,34 @@ def _review_research_csv(file_path: str, batch_size: int) -> None:
         console.print(f"[yellow]No rows found in {file_path}[/yellow]")
         return
 
-    if "exclude" not in fieldnames:
+    had_exclude_column = "exclude" in fieldnames
+    if not had_exclude_column:
         fieldnames.append("exclude")
 
+    initial_selected: list[bool] = []
+    for row in rows:
+        exclude_raw = (row.data.get("exclude") or "").strip().lower()
+        if exclude_raw in {"yes", "true", "1"}:
+            initial_selected.append(False)
+            continue
+        if exclude_raw in {"no", "false", "0"}:
+            initial_selected.append(True)
+            continue
+        if had_exclude_column:
+            # Blank exclude in existing reviewed files means "included".
+            initial_selected.append(True)
+            continue
+        # First-time review default: yes selected, maybe/no unselected.
+        initial_selected.append(_bucket_label(row.data.get("bucket", "")) == "yes")
+
     rows.sort(key=_research_sort_key)
-    saved = curses.wrapper(_run_research_tui, rows, max(1, batch_size))
+    saved = curses.wrapper(
+        _run_research_tui,
+        rows,
+        max(1, batch_size),
+        _normalize_tab(initial_tab),
+        initial_selected,
+    )
 
     if not saved:
         console.print("[dim]Cancelled — no changes made[/dim]")
@@ -450,14 +582,23 @@ def _review_research_csv(file_path: str, batch_size: int) -> None:
     )
 
 
-def review_contacts(file_path: str = "contacts.csv", batch_size: int = 10) -> None:
+def review_contacts(file_path: str = "contacts.csv", batch_size: int = 10, cli_tab: str = "yes") -> None:
     """Open the interactive review TUI and update the CSV with skip flags."""
     path = Path(file_path)
     if path.exists():
         with path.open(newline="") as f:
             reader = csv.DictReader(f)
-            if _is_research_csv(list(reader.fieldnames or [])):
-                _review_research_csv(file_path, batch_size=batch_size)
+            fieldnames = list(reader.fieldnames or [])
+            base_research = {"bucket", "full_name", "phone_e164"}
+            fields = set(fieldnames)
+            if base_research.issubset(fields) and "top_title_company_pairs" not in fields:
+                console.print(
+                    "[red]Research CSV missing required column: top_title_company_pairs. "
+                    "Regenerate from the latest pipeline output.[/red]"
+                )
+                return
+            if _is_research_csv(fieldnames):
+                _review_research_csv(file_path, batch_size=batch_size, initial_tab=cli_tab)
                 return
 
     contacts_dict = load_existing_contacts(file_path)

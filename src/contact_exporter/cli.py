@@ -145,7 +145,7 @@ def cmd_full(args):
 
 
 def cmd_review(args):
-    review_contacts(file_path=args.file, batch_size=args.batch_size)
+    review_contacts(file_path=args.file, batch_size=args.batch_size, cli_tab=args.cli_tab)
 
 
 def cmd_upload(args):
@@ -261,6 +261,14 @@ def main():
         type=int,
         default=10,
         help="Rows per page for research-review CSVs (default: 10)",
+    )
+    review_parser.add_argument(
+        "--cli",
+        "--tab",
+        dest="cli_tab",
+        choices=["yes", "maybe", "no"],
+        default="yes",
+        help="Initial research-review tab (yes/maybe/no)",
     )
 
     upload_parser = subparsers.add_parser("upload", help="Upload contacts to Powerset")
