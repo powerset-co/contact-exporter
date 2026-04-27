@@ -23,7 +23,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 
 from contact_exporter.matching import apply_local_name_matching, sync_candidate_catalog
 from contact_exporter.merge import load_existing_contacts, merge_contact, write_contacts
-from contact_exporter.models import Contact, canonicalize_phone
+from contact_exporter.models import Contact, canonicalize_phone, serialize_group_names
 
 console = Console()
 
@@ -130,6 +130,22 @@ def _is_phone_identifier(identifier: str) -> bool:
 def _is_group_identifier(identifier: str) -> bool:
     """Check if a chat identifier is a group chat."""
     return identifier.startswith("chat")
+
+
+def _resolve_group_chat_name(
+    chat_identifier: str,
+    display_name: str | None,
+    room_name: str | None,
+) -> str:
+    """Return a human-readable group name when chat.db exposes one."""
+    for candidate in (display_name, room_name):
+        cleaned = re.sub(r"\s+", " ", (candidate or "").strip())
+        if not cleaned:
+            continue
+        if cleaned == chat_identifier:
+            continue
+        return cleaned
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -351,12 +367,16 @@ def _aggregate_handle_message_stats() -> dict[str, dict]:
     return stats
 
 
-def _list_group_participant_phones() -> set[str]:
-    """Return all phone-like handles that appear in any group conversation."""
+def _list_group_participant_metadata() -> tuple[set[str], dict[str, set[str]]]:
+    """Return group participants plus any named iMessage groups they appear in."""
     conn = _open_chat_db()
     try:
         rows = conn.execute("""
-            SELECT DISTINCT h.id
+            SELECT
+                h.id AS identifier,
+                c.chat_identifier,
+                c.display_name,
+                c.room_name
             FROM chat c
             JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
             JOIN handle h ON h.ROWID = chj.handle_id
@@ -365,12 +385,20 @@ def _list_group_participant_phones() -> set[str]:
     finally:
         conn.close()
 
-    out: set[str] = set()
+    participants: set[str] = set()
+    group_names_by_identifier: dict[str, set[str]] = {}
     for row in rows:
-        identifier = row["id"] or ""
+        identifier = row["identifier"] or ""
         if _is_phone_identifier(identifier):
-            out.add(identifier)
-    return out
+            participants.add(identifier)
+            group_name = _resolve_group_chat_name(
+                row["chat_identifier"] or "",
+                row["display_name"],
+                row["room_name"],
+            )
+            if group_name:
+                group_names_by_identifier.setdefault(identifier, set()).add(group_name)
+    return participants, group_names_by_identifier
 
 
 # ---------------------------------------------------------------------------
@@ -401,11 +429,11 @@ def extract_imessage(
     with ThreadPoolExecutor(max_workers=3) as pool:
         fut_contacts = pool.submit(_build_contacts_index)
         fut_stats = pool.submit(_aggregate_handle_message_stats)
-        fut_groups = pool.submit(_list_group_participant_phones)
+        fut_groups = pool.submit(_list_group_participant_metadata)
 
         contacts_inventory, _ = fut_contacts.result()
         stats_by_identifier = fut_stats.result()
-        group_participants = fut_groups.result()
+        group_participants, group_names_by_identifier = fut_groups.result()
 
     if not contacts_inventory:
         console.print("[yellow]No local Contacts found[/yellow]")
@@ -435,6 +463,12 @@ def extract_imessage(
         for identifier in group_participants
         if len(_normalize_phone(identifier)) >= 7
     }
+    group_names_by_normalized: dict[str, set[str]] = {}
+    for identifier, group_names in group_names_by_identifier.items():
+        normalized = _normalize_phone(identifier)
+        if len(normalized) < 7:
+            continue
+        group_names_by_normalized.setdefault(normalized, set()).update(group_names)
 
     with Progress(
         SpinnerColumn(),
@@ -455,6 +489,7 @@ def extract_imessage(
                 name=name,
                 source="imessage",
                 is_in_group_chats=normalized in group_normalized,
+                group_names=serialize_group_names(group_names_by_normalized.get(normalized, set())),
                 message_count=msg_count or None,
                 last_message=stat.get("last_message"),
             )

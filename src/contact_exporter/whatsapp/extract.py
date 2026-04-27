@@ -33,7 +33,7 @@ from contact_exporter.config import (
 )
 from contact_exporter.matching import apply_local_name_matching, sync_candidate_catalog
 from contact_exporter.merge import load_existing_contacts, merge_contact, write_contacts
-from contact_exporter.models import Contact, canonicalize_phone
+from contact_exporter.models import Contact, canonicalize_phone, merge_group_names, serialize_group_names
 
 console = Console()
 
@@ -534,6 +534,26 @@ def _chat_message_count_hint(chat: dict) -> int | None:
     return None
 
 
+def _group_chat_name(chat: dict, chat_id: str) -> str:
+    """Best-effort group chat title from WAHA chat metadata."""
+    metadata = chat.get("groupMetadata") if isinstance(chat.get("groupMetadata"), dict) else {}
+    for candidate in (
+        chat.get("name"),
+        chat.get("subject"),
+        chat.get("formattedTitle"),
+        metadata.get("subject"),
+        metadata.get("name"),
+        metadata.get("formattedTitle"),
+    ):
+        cleaned = re.sub(r"\s+", " ", str(candidate or "").strip())
+        if not cleaned:
+            continue
+        if cleaned == chat_id:
+            continue
+        return cleaned
+    return ""
+
+
 def _get_chat_message_count(chat_id: str) -> int:
     """Count all messages in a 1:1 chat via paginated WAHA API reads."""
     total = 0
@@ -647,11 +667,13 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
 
     direct_chats: dict[str, dict] = {}
     group_member_phones: set[str] = set()
+    group_names_by_phone: dict[str, set[str]] = {}
     group_member_phone_to_name: dict[str, str] = {}
 
     for chat in chats:
         chat_id = _extract_jid(chat.get("id", ""))
         if "@g.us" in chat_id:
+            group_chat_name = _group_chat_name(chat, chat_id)
             participants = chat.get("participants") or chat.get("groupMetadata", {}).get("participants", [])
             if not participants:
                 # Newer WAHA responses may omit participants from /chats payload.
@@ -662,12 +684,16 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
                 phone = _jid_to_phone(_extract_jid(p.get("phoneNumber", ""))) or _jid_to_phone(p_jid)
                 if phone:
                     group_member_phones.add(phone)
+                    if group_chat_name:
+                        group_names_by_phone.setdefault(phone, set()).add(group_chat_name)
                     group_name = jid_to_name.get(p_jid, "")
                     if group_name and phone not in group_member_phone_to_name:
                         group_member_phone_to_name[phone] = group_name
                 else:
                     for ph in lid_to_phones.get(p_jid, []):
                         group_member_phones.add(ph)
+                        if group_chat_name:
+                            group_names_by_phone.setdefault(ph, set()).add(group_chat_name)
                         group_name = jid_to_name.get(p_jid, "")
                         if group_name and ph not in group_member_phone_to_name:
                             group_member_phone_to_name[ph] = group_name
@@ -683,6 +709,7 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
             name=phone_to_name.get(phone, ""),
             source="whatsapp",
             is_in_group_chats=phone in group_member_phones,
+            group_names=serialize_group_names(group_names_by_phone.get(phone, set())),
         )
         for phone in all_contact_phones
     }
@@ -779,6 +806,10 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
             if (not existing.name) and stats.get("name"):
                 existing.name = stats["name"]
             existing.is_in_group_chats = existing.is_in_group_chats or (phone in group_member_phones)
+            existing.group_names = merge_group_names(
+                existing.group_names,
+                serialize_group_names(group_names_by_phone.get(phone, set())),
+            )
             existing.message_count = int(stats.get("count", 0) or 0) or None
             existing.last_message = stats.get("last_message")
         else:
@@ -787,6 +818,7 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
                 name=stats.get("name", "") or "",
                 source="whatsapp",
                 is_in_group_chats=phone in group_member_phones,
+                group_names=serialize_group_names(group_names_by_phone.get(phone, set())),
                 message_count=int(stats.get("count", 0) or 0) or None,
                 last_message=stats.get("last_message"),
             )
@@ -800,11 +832,16 @@ def _extract_contacts_from_waha() -> dict[str, Contact]:
                 name=group_name,
                 source="whatsapp",
                 is_in_group_chats=True,
+                group_names=serialize_group_names(group_names_by_phone.get(phone, set())),
             )
             continue
 
         # Enrich existing union rows with group signal/name when missing.
         contacts_by_phone[phone].is_in_group_chats = True
+        contacts_by_phone[phone].group_names = merge_group_names(
+            contacts_by_phone[phone].group_names,
+            serialize_group_names(group_names_by_phone.get(phone, set())),
+        )
         if not contacts_by_phone[phone].name and group_name:
             contacts_by_phone[phone].name = group_name
 

@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 import unicodedata
+from typing import Iterable
 
 CSV_HEADERS = [
     "phone",
     "name",
     "source",
     "is_in_group_chats",
+    "group_names",
     "message_count",
     "last_message",
     "skip",
@@ -22,6 +24,8 @@ CSV_HEADERS = [
     "match_method",
     "match_reason",
 ]
+
+_GROUP_NAME_SEPARATOR = " | "
 
 
 def canonicalize_phone(raw: str) -> str:
@@ -79,6 +83,37 @@ def should_auto_skip(contact: "Contact") -> bool:
     return False
 
 
+def serialize_group_names(names: Iterable[str]) -> str | None:
+    """Normalize, dedupe, and serialize group names for CSV storage."""
+    cleaned = {
+        re.sub(r"\s+", " ", (name or "").strip())
+        for name in names
+        if (name or "").strip()
+    }
+    if not cleaned:
+        return None
+    return _GROUP_NAME_SEPARATOR.join(sorted(cleaned, key=str.casefold))
+
+
+def parse_group_names(raw: str | None) -> list[str]:
+    """Parse serialized group names from CSV."""
+    if not raw:
+        return []
+    return [
+        part.strip()
+        for part in raw.split(_GROUP_NAME_SEPARATOR)
+        if part.strip()
+    ]
+
+
+def merge_group_names(*values: str | None) -> str | None:
+    """Merge multiple serialized group-name values into one canonical string."""
+    names: list[str] = []
+    for value in values:
+        names.extend(parse_group_names(value))
+    return serialize_group_names(names)
+
+
 @dataclass
 class Contact:
     """A single extracted contact. One row in contacts.csv."""
@@ -87,6 +122,7 @@ class Contact:
     name: str
     source: str  # "imessage" or "whatsapp"
     is_in_group_chats: bool = False
+    group_names: str | None = None  # Named group chats containing this contact
     message_count: int | None = None
     last_message: str | None = None  # ISO 8601 timestamp
     skip: bool = False  # Set to True to exclude from upload
@@ -105,6 +141,7 @@ class Contact:
             self.name,
             self.source,
             str(self.is_in_group_chats).lower(),
+            self.group_names or "",
             str(self.message_count) if self.message_count is not None else "",
             self.last_message or "",
             "yes" if self.skip else "",
@@ -131,6 +168,7 @@ class Contact:
             name=row.get("name", ""),
             source=row.get("source", ""),
             is_in_group_chats=row.get("is_in_group_chats", "").lower() == "true",
+            group_names=row.get("group_names", "") or None,
             message_count=int(count) if count else None,
             last_message=row.get("last_message", "") or None,
             skip=row.get("skip", "").strip().lower() in ("yes", "true", "1"),

@@ -15,7 +15,7 @@ Everything runs on your machine. The only data that leaves is what you explicitl
 - **iMessage extraction** — reads `~/Library/Messages/chat.db` directly in read-only mode (no message content)
 - **WhatsApp extraction** — runs a local [WAHA](https://github.com/devlikeapro/waha) Docker container, authenticates via QR code
 - **Contact name resolution** — matches phone numbers to names via macOS Contacts.app
-- **Group chat detection** — flags contacts seen in group chats, extracts participants
+- **Group chat context** — flags contacts seen in group chats and stores named groups when available
 - **Full-history message frequency** — counts messages across full local history (no 90-day window, no cap)
 - **Smart merging** — re-running merges new data with existing exports; most recent data wins
 - **Local matching** — downloads your operator candidate catalog and matches locally by name
@@ -113,6 +113,7 @@ Each row in `contacts.csv`:
 | `name` | string | Contact name (from Contacts.app or WhatsApp) |
 | `source` | string | `"imessage"`, `"whatsapp"`, or `"imessage,whatsapp"` |
 | `is_in_group_chats` | bool | Whether this contact appears in any group chat |
+| `group_names` | string \| empty | Pipe-separated named group chats containing this contact |
 | `message_count` | int \| empty | Full-history message count for the contact |
 | `last_message` | string \| empty | ISO 8601 timestamp of most recent message |
 | `skip` | string | `"yes"` if marked to exclude from upload |
@@ -141,7 +142,7 @@ POWERSET_API_URL=http://localhost:8000 contact-exporter upload
 1. Reads `~/Library/Messages/chat.db` directly in read-only mode
 2. Queries macOS Contacts.app / AddressBook DB to resolve phone numbers to names
 3. Aggregates full-history message counts per contact in SQL (single pass)
-4. Flags group chat participants
+4. Flags group chat participants and captures named iMessage groups when available
 5. Syncs operator candidate catalog (`powerset_contacts.csv`) and applies local name matching
 6. Merges with any existing `contacts.csv` and writes all contacts
 
@@ -151,9 +152,10 @@ POWERSET_API_URL=http://localhost:8000 contact-exporter upload
 2. Authenticates via QR code scan on your phone
 3. Fetches contacts and chat list from the WAHA API
 4. Counts full 1:1 chat history (pagination / parallel fetch as needed)
-5. Keeps the container running for re-runs without re-authentication
-6. Syncs candidate catalog and applies local name matching
-7. Merges with existing data and writes full contact set
+5. Captures named WhatsApp groups per participant when WAHA exposes a title
+6. Keeps the container running for re-runs without re-authentication
+7. Syncs candidate catalog and applies local name matching
+8. Merges with existing data and writes full contact set
 
 ### Privacy
 

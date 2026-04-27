@@ -66,7 +66,8 @@ private aliases for informal relationships)
   - Just a single first name with no last name AND zero message count \
 (impossible to look up)
 - **Group chat only**: If someone ONLY appears in group chats with low \
-individual message count, they're less valuable
+individual message count, they're less valuable. Named groups can still add \
+useful context
 
 Be optimistic — these are real phone contacts, not random leads. When in doubt \
 about a full name, ALWAYS lean ENRICH. Only SKIP names that clearly cannot map \
@@ -115,6 +116,7 @@ def _load_contacts_for_review(csv_path: str, include_matched: bool = False) -> l
                 "name": name,
                 "source": row.get("source", ""),
                 "is_in_group_chats": row.get("is_in_group_chats", "false"),
+                "group_names": row.get("group_names", ""),
                 "message_count": int(row["message_count"]) if row.get("message_count") else 0,
                 "last_message": row.get("last_message", ""),
                 "skip": row.get("skip", ""),
@@ -155,6 +157,7 @@ def _build_batch_payload(batch: list[dict]) -> list[dict]:
             "message_count": c["message_count"],
             "last_contacted": _format_recency(c["last_message"]),
             "in_group_chats": c.get("is_in_group_chats", "false"),
+            "group_names": c.get("group_names", ""),
         })
     return payload
 

@@ -10,6 +10,7 @@ from contact_exporter.models import (
     Contact,
     canonicalize_phone,
     is_emoji_only_name,
+    merge_group_names,
     should_auto_skip,
 )
 
@@ -93,7 +94,13 @@ def merge_contact(existing: Contact, new: Contact) -> Contact:
         phone=existing.phone,
         name=_prefer_name(existing.name, new.name),
         source=source,
-        is_in_group_chats=existing.is_in_group_chats or new.is_in_group_chats,
+        is_in_group_chats=(
+            existing.is_in_group_chats
+            or new.is_in_group_chats
+            or bool(existing.group_names)
+            or bool(new.group_names)
+        ),
+        group_names=merge_group_names(existing.group_names, new.group_names),
         message_count=message_count,
         last_message=last_message,
         skip=existing.skip,  # Preserve skip from previous run

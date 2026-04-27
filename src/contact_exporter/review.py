@@ -250,6 +250,9 @@ def _render_research_card(
     city = (data.get("location_city") or "").strip()
     country = (data.get("location_country") or "").strip()
     location = ", ".join(part for part in [city, country] if part) or "—"
+    group_names = " | ".join(
+        part.strip() for part in (data.get("group_names") or "").split("|") if part.strip()
+    ) or "—"
     companies = " | ".join(part.strip() for part in (data.get("top_companies") or "").split("|") if part.strip()) or "—"
     raw_pairs = (data.get("top_title_company_pairs") or "").strip()
     title_company_pairs = " | ".join(part.strip() for part in raw_pairs.split("|") if part.strip()) or "—"
@@ -265,6 +268,7 @@ def _render_research_card(
     body_lines.extend(_wrap_plain(f"{head}  {head_meta}", inner_w))
     body_lines.extend(_wrap_prefixed("phone: ", phone, inner_w))
     body_lines.extend(_wrap_prefixed("location: ", location, inner_w))
+    body_lines.extend(_wrap_prefixed("groups: ", group_names, inner_w))
     body_lines.extend(_wrap_prefixed("title@company: ", title_company_pairs, inner_w))
     body_lines.extend(_wrap_prefixed("companies: ", companies, inner_w))
     body_lines.extend(_wrap_prefixed("education: ", education, inner_w))

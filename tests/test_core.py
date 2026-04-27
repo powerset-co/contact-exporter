@@ -33,10 +33,12 @@ from contact_exporter.imessage.extract import (
     _normalize_phone,
     _clean_contact_name,
     _add_phone_to_lookup,
+    _resolve_group_chat_name,
 )
 from contact_exporter.whatsapp.extract import (
     _extract_jid,
     _jid_to_phone,
+    _group_chat_name,
     _parse_timestamp,
     _render_qr_to_terminal,
 )
@@ -111,6 +113,29 @@ check("short number rejected", len(lookup2) == 0)
 lookup3: dict[str, str] = {}
 _add_phone_to_lookup(lookup3, "+14085354285", "   ")
 check("blank name rejected", len(lookup3) == 0)
+
+
+# ===================================================================
+# 3a. Group-name helpers
+# ===================================================================
+print("\n👥 Group-name helpers")
+
+check(
+    "imessage display_name preferred",
+    _resolve_group_chat_name("chat123", "Trip Crew", "chat123") == "Trip Crew",
+)
+check(
+    "imessage raw room name ignored",
+    _resolve_group_chat_name("chat123", "", "chat123") == "",
+)
+check(
+    "whatsapp top-level name used",
+    _group_chat_name({"name": "Founder Sync"}, "1203@g.us") == "Founder Sync",
+)
+check(
+    "whatsapp metadata subject fallback",
+    _group_chat_name({"groupMetadata": {"subject": "Weekend Plans"}}, "1203@g.us") == "Weekend Plans",
+)
 
 
 # ===================================================================
@@ -264,6 +289,7 @@ c1 = Contact(
     name="Test User",
     source="imessage",
     is_in_group_chats=True,
+    group_names="Founders | Ski Trip",
     message_count=42,
     last_message="2024-01-15T12:00:00Z",
     skip=False,
@@ -283,6 +309,7 @@ check("phone preserved", c2.phone == c1.phone)
 check("name preserved", c2.name == c1.name)
 check("source preserved", c2.source == c1.source)
 check("group flag preserved", c2.is_in_group_chats == c1.is_in_group_chats)
+check("group names preserved", c2.group_names == c1.group_names)
 check("msg count preserved", c2.message_count == c1.message_count)
 check("last_message preserved", c2.last_message == c1.last_message)
 check("skip preserved", c2.skip == c1.skip)
@@ -319,9 +346,11 @@ check("emoji-only auto-skip", should_auto_skip(Contact(phone="+1", name="😀", 
 print("\n🔀 Contact merge")
 
 a = Contact(phone="+1", name="Alice", source="imessage", message_count=10,
-            last_message="2024-01-01T00:00:00Z", is_in_group_chats=False, skip=True)
+            last_message="2024-01-01T00:00:00Z", is_in_group_chats=False,
+            group_names="Alpha", skip=True)
 b = Contact(phone="+1", name="", source="whatsapp", message_count=20,
-            last_message="2024-06-01T00:00:00Z", is_in_group_chats=True)
+            last_message="2024-06-01T00:00:00Z", is_in_group_chats=True,
+            group_names="Beta | Alpha")
 
 merged = merge_contact(a, b)
 check("name: first non-empty wins", merged.name == "Alice")
@@ -329,6 +358,7 @@ check("source: combined", merged.source == "imessage,whatsapp")
 check("msg_count: max wins", merged.message_count == 20)
 check("last_message: newer wins", merged.last_message == "2024-06-01T00:00:00Z")
 check("group: OR", merged.is_in_group_chats is True)
+check("group names: union + dedupe", merged.group_names == "Alpha | Beta", merged.group_names or "")
 check("skip: preserved from existing", merged.skip is True)
 
 # Merge with None message counts
@@ -378,8 +408,8 @@ with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
 
 try:
     mixed = {
-        "a": Contact(phone="+14155551234", name="Candela", source="imessage", message_count=10),
-        "b": Contact(phone="14155551234", name="Candela Whatsapp", source="whatsapp", message_count=5),
+        "a": Contact(phone="+14155551234", name="Candela", source="imessage", message_count=10, group_names="Alpha"),
+        "b": Contact(phone="14155551234", name="Candela Whatsapp", source="whatsapp", message_count=5, group_names="Beta"),
         "c": Contact(phone="+14155550000", name="", source="imessage", message_count=0),
         "d": Contact(phone="+14155550001", name="❤️", source="whatsapp", message_count=2),
     }
@@ -389,6 +419,7 @@ try:
     merged_candela = loaded2.get("+14155551234")
     check("merged row exists", merged_candela is not None)
     check("sources merged after dedupe", merged_candela.source == "imessage,whatsapp", merged_candela.source if merged_candela else "")
+    check("group names merged after dedupe", merged_candela.group_names == "Alpha | Beta", merged_candela.group_names if merged_candela else "")
     check("empty+0 marked skip", loaded2["+14155550000"].skip is True)
     check("emoji-only marked skip", loaded2["+14155550001"].skip is True)
 finally:
