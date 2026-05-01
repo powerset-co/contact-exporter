@@ -309,6 +309,11 @@ def _run_research_tui(
     else:
         selected = [True] * total
 
+    # Only commit `exclude` updates for rows the user actually toggled in this
+    # session. Untouched rows keep whatever bucket+exclude they had on disk so
+    # opening one tab and saving never silently nukes the others.
+    modified: set[int] = set()
+
     active_tab = _normalize_tab(initial_tab)
     cursor_pos_by_tab: dict[str, int] = {tab: 0 for tab in _RESEARCH_TABS}
     line_to_idx: dict[int, int] = {}
@@ -462,18 +467,25 @@ def _run_research_tui(
         elif key == ord(" ") and tab_total > 0:
             idx = tab_indices[cursor_pos]
             selected[idx] = not selected[idx]
+            modified.add(idx)
         elif key == ord("a"):
             for idx in tab_indices:
                 selected[idx] = True
+                modified.add(idx)
         elif key == ord("d"):
             for idx in tab_indices:
                 selected[idx] = False
+                modified.add(idx)
         elif key == ord("s"):
             for tab_pos in range(batch_start_pos, batch_end_pos):
-                selected[tab_indices[tab_pos]] = True
+                idx = tab_indices[tab_pos]
+                selected[idx] = True
+                modified.add(idx)
         elif key == ord("x"):
             for tab_pos in range(batch_start_pos, batch_end_pos):
-                selected[tab_indices[tab_pos]] = False
+                idx = tab_indices[tab_pos]
+                selected[idx] = False
+                modified.add(idx)
         elif key == ord("n"):
             if tab_total > 0 and batch_idx < total_batches - 1:
                 cursor_pos_by_tab[active_tab] = min(tab_total - 1, (batch_idx + 1) * batch_size)
@@ -481,13 +493,23 @@ def _run_research_tui(
             if tab_total > 0 and batch_idx > 0:
                 cursor_pos_by_tab[active_tab] = (batch_idx - 1) * batch_size
         elif key in (curses.KEY_ENTER, 10, 13):
-            for i, row in enumerate(rows):
+            # Only write `exclude` for rows the user actually touched this
+            # session. Untouched rows keep whatever they had on disk —
+            # critical so that flipping one MAYBE row and saving does not
+            # silently rewrite all the other maybes/reviews to bucket=no,
+            # exclude=yes. Bucket is research-derived metadata and never
+            # gets overwritten by the TUI.
+            #
+            # Use exclude="no" (not blank) for explicit include, so the
+            # toggle round-trips through reopen: the file's reload path treats
+            # blank exclude as "no decision yet" and falls back to the bucket
+            # default, which for a maybe row means unselected. Writing "no"
+            # is the explicit "user said include this" signal.
+            for i in modified:
                 if selected[i]:
-                    row.data["exclude"] = ""
+                    rows[i].data["exclude"] = "no"
                 else:
-                    row.data["exclude"] = "yes"
-                    # Excluded rows should not stay in positive buckets.
-                    row.data["bucket"] = "no"
+                    rows[i].data["exclude"] = "yes"
             return True
         elif key in (ord("q"), 27):
             return False
@@ -518,6 +540,7 @@ def _run_research_tui(
                 if idx in current_tab_indices:
                     cursor_pos_by_tab[active_tab] = current_tab_indices.index(idx)
                 selected[idx] = not selected[idx]
+                modified.add(idx)
 
 
 def _is_research_csv(fieldnames: list[str]) -> bool:
@@ -553,11 +576,13 @@ def _review_research_csv(file_path: str, batch_size: int, initial_tab: str) -> N
         if exclude_raw in {"no", "false", "0"}:
             initial_selected.append(True)
             continue
-        if had_exclude_column:
-            # Blank exclude in existing reviewed files means "included".
-            initial_selected.append(True)
-            continue
-        # First-time review default: yes selected, maybe/no unselected.
+        # No explicit user decision (blank or missing exclude). Default by
+        # bucket: confident/yes rows are pre-selected, maybe/review rows are
+        # not. This used to default-select everything when the column existed,
+        # which combined with the destructive save to silently rewrite untouched
+        # rows to bucket=no on Enter. Since the new save logic only commits
+        # rows the user actually touched, defaulting by bucket is both safer
+        # and more consistent with the first-open behavior.
         initial_selected.append(_bucket_label(row.data.get("bucket", "")) == "yes")
 
     rows.sort(key=_research_sort_key)
@@ -580,9 +605,32 @@ def _review_research_csv(file_path: str, batch_size: int, initial_tab: str) -> N
             out = {k: r.data.get(k, "") for k in fieldnames}
             writer.writerow(out)
 
-    excluded = sum(1 for r in rows if (r.data.get("exclude") or "").strip().lower() in {"yes", "true", "1"})
+    # Compute what the server will see on upload, mirroring its yes/maybe/no
+    # accounting:
+    #   exclude=yes  → no
+    #   exclude=no   → yes (explicit user include)
+    #   blank        → bucket default (confident=yes, medium=maybe, review=no)
+    counts = {"yes": 0, "maybe": 0, "no": 0}
+    explicit_include = 0
+    explicit_exclude = 0
+    for r in rows:
+        ex = (r.data.get("exclude") or "").strip().lower()
+        if ex in {"yes", "true", "1"}:
+            counts["no"] += 1
+            explicit_exclude += 1
+        elif ex in {"no", "false", "0"}:
+            counts["yes"] += 1
+            explicit_include += 1
+        else:
+            counts[_bucket_label(r.data.get("bucket", ""))] += 1
     console.print(
-        f"\n[green bold]✅ Saved research review: kept {len(rows) - excluded}, excluded {excluded}[/green bold]"
+        f"\n[green bold]✅ Saved research review: yes={counts['yes']} "
+        f"maybe={counts['maybe']} no={counts['no']}[/green bold]"
+    )
+    console.print(
+        f"[dim]   ({explicit_include} explicitly included, "
+        f"{explicit_exclude} explicitly excluded, "
+        f"{len(rows) - explicit_include - explicit_exclude} using bucket default)[/dim]"
     )
 
 
